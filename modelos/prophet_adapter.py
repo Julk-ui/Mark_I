@@ -1,6 +1,6 @@
-# modelos/prophet_model.py
+# modelos/prophet_adapter.py
 # Adapter Prophet compatible con la misma interfaz que ARIMA/MLP/LSTM
-# Requisitos: prophet (cmd: pip install prophet), pandas, numpy
+# Requisitos: prophet (pip install prophet), pandas, numpy
 
 from __future__ import annotations
 import pandas as pd
@@ -69,7 +69,7 @@ def _seasonality_defaults_from_freq(freq: Optional[str]) -> Dict[str, bool]:
 def entrenar_modelo_prophet(
     df: pd.DataFrame,
     modo: str = 'nivel',                     # 'nivel' | 'retornos'
-    frecuencia_hint: Optional[str] = None,   # '15min' | '1H' | 'D' ... (opcional pero recomendado)
+    frecuencia_hint: Optional[str] = None,   # '15min' | '1H' | 'D' ... (opcional)
     interval_width: float = 0.90,            # bandas de confianza 90%
     seasonality_mode: str = 'additive',      # 'additive' | 'multiplicative'
     changepoint_prior_scale: float = 0.05,
@@ -172,23 +172,7 @@ def predecir_precio_prophet(
             'yhat_upper': 'max_esperado'
         })[['timestamp_prediccion', 'precio_estimado', 'min_esperado', 'max_esperado']]
 
-    # Tipos consistentes
     out['precio_estimado'] = out['precio_estimado'].astype(float)
     out['min_esperado']    = out['min_esperado'].astype(float)
     out['max_esperado']    = out['max_esperado'].astype(float)
     return out
-
-
-# -------------------------------
-# 🔁 Alias para compatibilidad con main.py
-# -------------------------------
-def predecir_precio(modelo_dict: Dict[str, Any], pasos: int = 3, frecuencia: Optional[str] = None) -> pd.DataFrame:
-    """Compat: main.py importa predecir_precio desde prophet_model."""
-    return predecir_precio_prophet(modelo_dict, pasos=pasos, frecuencia=frecuencia)
-
-
-__all__ = [
-    "entrenar_modelo_prophet",
-    "predecir_precio_prophet",
-    "predecir_precio",  # alias
-]

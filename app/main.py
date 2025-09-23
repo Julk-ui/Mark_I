@@ -196,7 +196,9 @@ try:
     # 6) REPORTE BASE (asegura archivo)
     # =========================
     ruta_excel = ruta_reporte
-    generar_reporte_excel(predicciones, senal, capital, operacion, umbral=umbral_senal)
+    # Asegura directorio de salida antes de escribir
+    os.makedirs(os.path.dirname(ruta_reporte) or ".", exist_ok=True)
+    generar_reporte_excel(predicciones, senal, capital, operacion, umbral=umbral_senal, ruta=ruta_reporte)
 
     # =========================
     # 7) EVALUACIÓN (métricas + horizonte) MODULAR
@@ -268,7 +270,7 @@ try:
             sl=sl,
             tp=tp
         )
-        print(f"🚀 Orden enviada a MT5: {senal.UPPER()} {simbolo} con {volumen} lotes")
+        print(f"🚀 Orden enviada a MT5: {senal.upper()} {simbolo} con {volumen} lotes")
     else:
         print("❎ No se envió operación real (señal fue 'mantener' o capital = 0)")
 

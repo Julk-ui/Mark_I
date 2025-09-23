@@ -1,26 +1,58 @@
-# Mark_I — Análisis (EDA) y Modelado de Activos (EURUSD / SPY)
+# Mark_I — EDA + Forecast + Señales (EURUSD / SPY)
 
-Este proyecto implementa un flujo **CRISP-DM** para:
-1) **EDA (Exploratory Data Analysis)** de **EURUSD** y **SPY**  
-2) **Entrenamiento y predicción** con **Prophet**, generación de **señal operativa**, **asignación de capital** y **reporte**.
+Pipeline completo:
+1) **EDA (CRISP-DM)** con tablas y gráficos (PDF/Excel).
+2) **Modelado** (Prophet) con predicciones multi-paso.
+3) **Señal operativa**, **asignación de capital**, **reporte** y **(opcional) ejecución en MT5**.
 
-> Se ejecuta desde terminal, sin necesidad de modificar el código. La **configuración** se controla mediante `utils/config.yaml`.
+La configuración se gestiona vía `utils/config.yaml`.
 
 ---
 
-## 📁 Estructura del proyecto (carpetas clave)
+## 📦 Requisitos e instalación
 
-```
+### 1) Entorno
+- **Python 3.10–3.11** recomendado (64-bit).
+- **Windows** para integrar con **MetaTrader 5** (recomendado 64-bit).
+
+Crear entorno virtual:
+
+```bash
+# Windows PowerShell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# macOS/Linux
+python3 -m venv .venv
+source .venv/bin/activate
+2) Dependencias
+Actualizar pip y luego instalar:
+
+bash
+Copiar código
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Opcional (LSTM): si no usarás lstm_adapter.py, puedes quitar tensorflow-cpu del requirements.txt.
+
+3) MetaTrader 5
+Instala la terminal de MetaTrader 5 y ten a mano credenciales.
+El script se conecta con los parámetros de utils/config.yaml o variables de entorno:
+MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH.
+
+🗂️ Estructura (carpetas clave)
+bash
+Copiar código
 Mark_I/
 ├─ app/
-│  ├─ __init__.py
 │  └─ main.py                 # punto de entrada
 ├─ procesamiento/
-│  ├─ eda_crispdm.py          # EDA CRISP-DM (EURUSD y SPY)
-│  └─ features.py
+│  ├─ eda_crispdm.py          # EDA CRISP-DM (PDF/Excel + diag.)
+│  └─ features.py             # indicadores robustos (compatibles c/ main)
 ├─ modelos/
-│  ├─ prophet_model.py
-│  └─ evaluacion_modelos.py
+│  ├─ prophet_model.py        # adapter Prophet
+│  ├─ evaluacion_modelos.py   # métricas + backtest simple
+│  ├─ lstm_adapter.py         # (opcional) LSTM univariante
+│  └─ mlp_adapter.py          # (opcional) MLP univariante
 ├─ agentes/
 │  ├─ agente_analisis.py
 │  ├─ agente_portafolio.py
@@ -30,193 +62,184 @@ Mark_I/
 ├─ reportes/
 │  └─ reportes_excel.py
 ├─ utils/
-│  └─ config.yaml             # configuración del usuario (ver ejemplo abajo)
-├─ outputs/                   # resultados (se crea al ejecutar)
-└─ requirements.txt
-```
+│  └─ config.yaml
+└─ outputs/                   # resultados
+Compatibilidad mantenida: features.py conserva aplicar_todos_los_indicadores(...).
 
-> Asegúrate de que `app/` tenga `__init__.py` (aunque sea vacío) para poder ejecutar con `python -m app.main`.
+⚙️ Configuración (utils/config.yaml)
+Campos principales:
 
----
+simbolo: p.ej. EURUSD
 
-## 🛠️ Requisitos e instalación
+timeframe: M1|M5|M15|H1|D1
 
-1) **Python 3.10+** y (opcional) **entorno virtual**  
-   **PowerShell (Windows):**
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-   **CMD (Windows):**
-   ```cmd
-   python -m venv .venv
-   .\.venv\Scripts\activate.bat
-   ```
-   **macOS/Linux:**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
+cantidad_datos: velas a extraer
 
-2) **Dependencias**
-   - Usa el `requirements.txt` del repo y agrega (si no están) estas librerías para el EDA:
-     ```
-     scipy>=1.10
-     statsmodels>=0.14
-     xlsxwriter>=3.0   # opcional si NO usas el fallback a openpyxl
-     ```
-   - Instala:
-     ```bash
-     python -m pip install --upgrade pip setuptools wheel
-     python -m pip install -r requirements.txt
-     ```
+modelo: prophet (en main.py actual)
 
-3) **MetaTrader 5** instalado y credenciales válidas del broker si usarás extracción en vivo.
+pasos_prediccion: horizonte (n pasos)
 
----
+frecuencia_prediccion: p.ej. 15min, H, D
 
-## ⚙️ Configuración del usuario (`utils/config.yaml`)
+umbral_senal: (p.ej. 0.0003)
 
-Ajusta estos campos. Puedes partir del **ejemplo** más abajo.
+riesgo_por_trade: p.ej. 0.02
 
-### 🔎 Descripción de variables principales
+volumen_minimo: p.ej. 0.01
 
-- **simbolo**: activo base (ej. `EURUSD`).
-- **timeframe**: marco temporal (`M1`, `M5`, `M15`, `H1`, `D1`).
-- **cantidad_datos**: número de velas a extraer de MT5.
-- **modelo**: hoy `prophet` (otros modelos pueden integrarse).
-- **pasos_prediccion / frecuencia_prediccion**: horizonte de proyección (p. ej. `48` * `H` = 48 horas).
-- **umbral_senal**: define cuándo la predicción se considera compra/venta vs. mantener.
-- **riesgo_por_trade**: % del balance a arriesgar por operación (ej. `0.02` = 2%).
-- **volumen_minimo**: piso de lotaje permitido (ej. `0.01`).
-- **stop_loss_pips / take_profit_pips**: distancias en pips para SL/TP.
-- **pip_size** (opcional): fuerza el tamaño de pip si el broker lo reporta raro.
-- **eda.habilitar**: si `true`, el flujo normal genera EDA además del modelado.
-- **eda.frecuencia_resampleo**: agregación del EDA (`D`, `H`, `15T`, …).
-- **simbolo_spy**: símbolo SPY en tu broker. Si no existe, usa `spy_csv`.
-- **spy_csv**: ruta a CSV de SPY si no hay símbolo en MT5.  
-  - Mínimo: `timestamp`, `Close`. Ideal: `timestamp, Open, High, Low, Close, Volume`.
-- **mt5**: credenciales y ruta del terminal MT5. Considera variables de entorno por seguridad.
+stop_loss_pips / take_profit_pips
 
-> **Seguridad**: mueve `mt5.login`, `mt5.password`, etc. a variables de entorno (`MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_PATH`) y no subas tus credenciales al repo.
+pip_size (opcional) — fuerza tamaño de pip si el broker reporta algo inusual
 
----
+ruta_reporte: p.ej. outputs/reporte_inversion.xlsx
 
-## ▶️ Cómo ejecutar
+eda:
 
-> **Siempre ejecuta desde la raíz del proyecto** (la carpeta que contiene `app/` y `utils/`).
+habilitar: true|false (genera EDA en el flujo normal)
 
-### 1) Solo EDA (EURUSD + SPY)
+frecuencia_resampleo: D|H|15T|...
 
-**Frecuencia diaria:**
-```bash
+outdir: outputs/eda
+
+export_pdf: true|false
+
+pdf_filename: nombre del PDF
+
+SPY (segundo activo del EDA):
+
+simbolo_spy: si tu broker lo tiene (p.ej. SPY, US500, etc.)
+
+spy_csv: ruta CSV alternativa si el símbolo no está en MT5
+(mínimo: timestamp, Close; ideal: Open, High, Low, Close, Volume)
+
+Credenciales MT5 (recomendado por variables de entorno):
+
+text
+Copiar código
+MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH
+▶️ Ejecución
+EDA (solo análisis)
+bash
+Copiar código
+# Diario
 python -m app.main --modo eda --freq D
-```
 
-**Frecuencia horaria:**
-```bash
+# Horario
 python -m app.main --modo eda --freq H
-```
 
-**Frecuencia 15 minutos:**
-```bash
+# 15 minutos
 python -m app.main --modo eda --freq 15T
-```
+Genera:
 
-- Si `simbolo_spy` no existe en tu broker, define un **CSV** en `spy_csv` (ver Configuración).
-- Salidas del EDA:
-  - **Excel**: `outputs/eda/EDA_resumen.xlsx`  
-    - Hojas: `EURUSD_basic`, `EURUSD_drawdown`, `EURUSD_dd_summary`, `EURUSD_stationarity`, `SPY_*`, `Correlation_matrix`, `Rolling_corr_60`.
-  - **Gráficos**: `outputs/eda/*.png`  
-    - Precio + SMAs, log-returns, volatilidad rolling, ACF/PACF, STL, correlación móvil EURUSD–SPY.
+PDF: outputs/eda/EDA_informe.pdf
 
-### 2) Flujo normal (modelado + señal + reporte + ejecución)
+Excel: outputs/eda/EDA_informe.xlsx
 
-```bash
-# modo normal explícito
-python -m app.main --modo normal
+Gráficos en outputs/eda/*.png
 
-# o simplemente (por defecto es normal)
+Flujo normal (forecast + señal + reporte + métrica)
+bash
+Copiar código
 python -m app.main
-```
+# (equivalente a --modo normal)
+Entrega:
 
-- Entrena **Prophet**, genera **predicciones**, **señal**, **asignación** y, si aplica, envía orden a MT5.
-- Reporte base en: `outputs/reporte_inversion.xlsx`.
-- Métricas del modelo (MAE, RMSE, MAPE, R², Sortino, Accuracy direccional, horizonte) se escriben en el reporte (hoja de métricas e histórico).
+Predicciones Prophet
 
----
+Señal (comprar|vender|mantener)
 
-## 📤 Resultados generados
+Asignación (según riesgo)
 
-- `outputs/eda/`  
-  - `EDA_resumen.xlsx` (tablas EDA)  
-  - `*.png` (gráficos EDA)
-- `outputs/reporte_inversion.xlsx`  
-  - Señal, predicciones, asignación, operación simulada.
-  - Métricas del modelo (hoja de métricas + histórico).
+Reporte Excel: outputs/reporte_inversion.xlsx
 
----
+Métricas del modelo (MAE, RMSE, MAPE, R², Sortino, Accuracy direccional, Horizonte)
 
-## 🧪 Inspección rápida de tablas (opcional)
+📈 Indicadores y Features
+procesamiento/features.py:
 
-Ver tablas del Excel EDA sin abrir Excel:
+Robustez de índice temporal (ensure_time_index) y detección de columna de cierre (find_close).
 
-```bash
-python -c "import pandas as pd; print(pd.read_excel('outputs/eda/EDA_resumen.xlsx','EURUSD_basic')); print(); print(pd.read_excel('outputs/eda/EDA_resumen.xlsx','SPY_basic'))"
-python -c "import pandas as pd; print(pd.read_excel('outputs/eda/EDA_resumen.xlsx','EURUSD_stationarity')); print(); print(pd.read_excel('outputs/eda/EDA_resumen.xlsx','SPY_stationarity'))"
-python -c "import pandas as pd; print(pd.read_excel('outputs/eda/EDA_resumen.xlsx','Correlation_matrix'))"
-```
+RSI (suavizado tipo Wilder), MACD, LogReturns, ATR (si hay OHLC), Bollinger, Momentum, SMA/EMA, Volumen normalizado.
 
----
+Orquestador:
 
-## 🔧 Solución de problemas (FAQ)
+aplicar_todos_los_indicadores(df) — compatible con tu código actual.
 
-- **`ModuleNotFoundError: statsmodels`**  
-  ```bash
-  python -m pip install statsmodels scipy
-  ```
+aplicar_indicadores(df, config=?, limpiar_nans=?) — configurable.
 
-- **`ModuleNotFoundError: xlsxwriter`**  
-  - Instala:
-    ```bash
-    python -m pip install xlsxwriter
-    ```
-  - O usa el **fallback a openpyxl** (ya soportado si aplicaste el cambio en `eda_crispdm.py`).
+Ejemplo configurable:
 
-- **Error de conexión MT5**  
-  - Verifica credenciales/servidor/ruta en `utils/config.yaml` (o variables de entorno).
-  - Asegúrate de tener **MetaTrader 5** instalado y sesión disponible.
+python
+Copiar código
+from procesamiento.features import aplicar_indicadores
+df_feat = aplicar_indicadores(df, config={
+  "rsi": {"periodo": 14},
+  "bollinger": {"periodo": 20, "num_std": 2.0},
+  "atr": {"periodo": 14},
+  "ema": False  # desactiva EMA si no la quieres
+}, limpiar_nans=True)
+🧪 Métricas y Backtest simple
+modelos/evaluacion_modelos.py hace:
 
-- **El símbolo SPY no existe en tu broker**  
-  - Usa `spy_csv` en `config.yaml`.  
-    - Columnas mínimas: `timestamp`, `Close` (UTC o normalizables por pandas).
+Split (train hasta -pasos, test últimos pasos)
 
-- **`pip` instala en otro Python**  
-  ```bash
-  python -c "import sys; print(sys.executable)"
-  python -m pip -V
-  ```
-  Deben apuntar a `.venv`. Si no, activa:
-  ```powershell
-  .\.venv\Scripts\Activate.ps1
-  ```
+MAE, RMSE, MAPE, R²
 
----
+Sortino sobre retornos (pred vs real)
 
-## 🧭 Metodología (CRISP-DM)
+Accuracy direccional
 
-- **Business Understanding**: `utils/config.yaml` (parámetros de negocio, riesgo y operación).
-- **Data Understanding**: `procesamiento/eda_crispdm.py` (EDA EURUSD y SPY).
-- **Data Preparation**: `procesamiento/features.py` (indicadores y transformaciones).
-- **Modeling**: `modelos/prophet_model.py`.
-- **Evaluation**: `modelos/evaluacion_modelos.py` + reportes/EDA.
-- **Deployment**: `agentes/*` + integración MT5 en `app/main.py`.
+Horizonte tomando timestamps del forecast live
 
----
+🚀 MT5: ejecución (opcional)
+app/main.py calcula SL/TP por pips del YAML, tamaño por riesgo fijo, y abre orden con easy_Trading.Basic_funcs.
 
-## 📚 Referencias
+Se corrige UPPER() → upper() en logs de orden.
 
-- **CRISP-DM 1.0** (SPSS/IBM) – metodología de minería de datos.
-- Hyndman & Athanasopoulos. *Forecasting: Principles and Practice*.
-- Box, Jenkins & Reinsel. *Time Series Analysis: Forecasting and Control*.
-- **MetaTrader5 (Python)** – API para extracción OHLCV.
+🛟 Problemas comunes
+1) Prophet / CmdStan (compilación)
+
+prophet usa cmdstanpy y puede descargar/compilar CmdStan al primer uso.
+
+Requisitos del sistema:
+
+Windows: Microsoft C++ Build Tools (VS 2019+), make (p. ej. RTools o mingw64 con make).
+
+macOS: Xcode Command Line Tools.
+
+Linux: gcc, g++, make.
+
+Si falla la compilación, prueba:
+
+python
+Copiar código
+import cmdstanpy
+cmdstanpy.install_cmdstan()
+y revisa el log de compilación que imprime la ruta de CmdStan.
+
+2) TensorFlow
+
+Si no usarás LSTM, quita tensorflow-cpu del requirements.txt.
+
+En algunas GPUs/CPUs (Windows), tensorflow estándar puede dar conflictos; usa tensorflow-cpu.
+
+3) MT5
+
+Asegúrate de:
+
+Python y MT5 sean ambos 64-bit.
+
+MT5_PATH apunte al terminal64.exe.
+
+El broker/servidor sea correcto.
+
+4) Columnas de entrada
+
+Para EDA/Features: la serie debe tener columna temporal (time|timestamp|...) o índice datetime y al menos una columna de cierre (Close|close|price|...).
+
+📚 Referencias (metodología y libretas)
+CRISP-DM 1.0 — guía del ciclo de analítica.
+
+Hyndman & Athanasopoulos. Forecasting: Principles and Practice (Prophet/estacionalidad/ETS).
+
+Box, Jenkins & Reinsel. Time Series Analysis (ARIMA/diagnóstico).

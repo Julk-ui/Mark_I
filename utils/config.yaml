@@ -22,7 +22,7 @@ ruta_reporte: "outputs/reporte_inversion.xlsx"
 # === EDA (CRISP-DM) ===
 eda:
   habilitar: true
-  frecuencia_resampleo: "H"         # o "D", "15T", etc.
+  frecuencia_resampleo: "D"         # o "D", "15T", etc.
   outdir: "outputs/eda"
   ventana_media_movil: 30
   acf_lags: 40
