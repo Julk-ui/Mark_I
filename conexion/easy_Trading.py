@@ -1,450 +1,278 @@
-import pandas as pd
-import numpy as np
+# ==========================================
+# conexion/easy_Trading.py  (versión unificada y corregida)
+# ==========================================
 import MetaTrader5 as mt5
+import pandas as pd
+from datetime import datetime
+from typing import Optional
 from urllib.request import urlopen, Request
 from bs4 import BeautifulSoup
-from datetime import datetime
-                                                        
-class Basic_funcs():
 
-    def __init__(self,nombre, clave,servidor,path):
-        self.nombre = nombre
-        self.clave = clave
-        self.servidor = servidor
+# ----------------- Timeframe map -----------------
+_TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1, "M2": mt5.TIMEFRAME_M2, "M3": mt5.TIMEFRAME_M3,
+    "M4": mt5.TIMEFRAME_M4, "M5": mt5.TIMEFRAME_M5, "M6": mt5.TIMEFRAME_M6,
+    "M10": mt5.TIMEFRAME_M10, "M12": mt5.TIMEFRAME_M12, "M15": mt5.TIMEFRAME_M15,
+    "M20": mt5.TIMEFRAME_M20, "M30": mt5.TIMEFRAME_M30,
+    "H1": mt5.TIMEFRAME_H1, "H2": mt5.TIMEFRAME_H2, "H3": mt5.TIMEFRAME_H3,
+    "H4": mt5.TIMEFRAME_H4, "H6": mt5.TIMEFRAME_H6, "H8": mt5.TIMEFRAME_H8,
+    "H12": mt5.TIMEFRAME_H12,
+    "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1, "MN1": mt5.TIMEFRAME_MN1,
+}
+
+def _tf_to_mt5(tf: str) -> int:
+    t = str(tf).upper()
+    if t not in _TIMEFRAME_MAP:
+        raise ValueError(f"Timeframe no soportado: {tf}")
+    return _TIMEFRAME_MAP[t]
+
+# =================================================
+#                   Basic_funcs
+# =================================================
+class Basic_funcs:
+    """
+    Clase de utilidades para conexión y operaciones con MetaTrader 5.
+    Se conecta en __init__ y NO vuelve a inicializar dentro de cada método.
+    """
+
+    def __init__(self, login: int, password: str, server: str, path: Optional[str] = None):
+        self.login = int(login) if login is not None else None
+        self.password = str(password) if password is not None else None
+        self.server = str(server) if server is not None else None
         self.path = path
-    
-    def modify_orders(self, symb: str,ticket:int,stop_loss:float = None,take_profit:float = None,type_order = mt5.ORDER_TYPE_BUY) -> None:
+        self._connected = False
+        self._connect()
 
-        if (stop_loss != None) and (take_profit == None): 
-            modify_order_request = {
+    # ---------- conexión ----------
+    def _connect(self):
+        if self._connected:
+            return
+        ok = mt5.initialize(path=self.path, login=self.login, password=self.password, server=self.server) \
+             if self.path else \
+             mt5.initialize(login=self.login, password=self.password, server=self.server)
+        if not ok:
+            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        if not mt5.login(self.login, password=self.password, server=self.server):
+            raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
+        self._connected = True
 
-                'action': mt5.TRADE_ACTION_SLTP,
-                'symbol':  symb,
-                'position': ticket ,
-                'type': type_order,
-                'sl': stop_loss,
-                'type_time': mt5.ORDER_TIME_GTC,
-                'type_filling': mt5.ORDER_FILLING_FOK
-                                    }
+    def __del__(self):
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
 
-            mt5.order_send(modify_order_request)
+    # ---------- datos ----------
+    def get_data_for_bt(self, timeframe: str, symbol: str, count: int) -> pd.DataFrame:
+        """
+        Devuelve OHLCV con columnas: ['Date','Open','High','Low','Close','TickVolume','Volume']
+        Index = Date (tz-naive), orden ascendente.
+        """
+        tf = _tf_to_mt5(timeframe)
+        rates = mt5.copy_rates_from_pos(symbol, tf, 0, int(count))
+        if rates is None:
+            raise RuntimeError(f"No se obtuvieron rates de {symbol} {timeframe}: {mt5.last_error()}")
+        df = pd.DataFrame(rates)
+        # MT5 entrega 'time' en epoch seconds (UTC). Convertimos a naive (sin tz).
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
+        df = df.rename(columns={
+            "time": "Date",
+            "open": "Open", "high": "High", "low": "Low", "close": "Close",
+            "tick_volume": "TickVolume", "real_volume": "Volume"
+        })
+        # uniformamos columnas mínimas
+        cols = ["Date","Open","High","Low","Close","TickVolume","Volume"]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        df = df[cols].sort_values("Date").set_index("Date")
+        return df
 
-        elif (stop_loss == None) and (take_profit != None): 
-            modify_order_request = {
+    def get_data_from_dates(self, year_ini, month_ini, day_ini,
+                            year_fin, month_fin, day_fin,
+                            symbol: str, timeframe: str, for_bt: bool = False) -> pd.DataFrame:
+        """
+        Extrae datos por rango de fechas. Si for_bt=True, devuelve columnas estandarizadas.
+        """
+        tf = _tf_to_mt5(timeframe)
+        from_date = datetime(year_ini, month_ini, day_ini)
+        to_date   = datetime(year_fin, month_fin, day_fin)
+        rates = mt5.copy_rates_range(symbol, tf, from_date, to_date)
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(None)
+        if for_bt:
+            df = df.rename(columns={
+                "time": "Date",
+                "open": "Open", "high": "High", "low": "Low", "close": "Close",
+                "tick_volume": "TickVolume", "real_volume": "Volume"
+            })
+            df = df[["Date","Open","High","Low","Close","TickVolume","Volume"]].sort_values("Date").set_index("Date")
+        return df
 
+    # ---------- órdenes ----------
+    def modify_orders(self, symb: str, ticket: int,
+                      stop_loss: float = None, take_profit: float = None,
+                      type_order=mt5.ORDER_TYPE_BUY) -> None:
+        req = {
             'action': mt5.TRADE_ACTION_SLTP,
-            'symbol':  symb,
-            'position': ticket ,
+            'symbol': symb,
+            'position': ticket,
             'type': type_order,
-            'tp': take_profit,
             'type_time': mt5.ORDER_TIME_GTC,
             'type_filling': mt5.ORDER_FILLING_FOK
-                                    }
+        }
+        if stop_loss is not None:
+            req['sl'] = stop_loss
+        if take_profit is not None:
+            req['tp'] = take_profit
+        mt5.order_send(req)
 
-            mt5.order_send(modify_order_request)
-        
+    def open_operations(self, par: str, volumen: float, tipo_operacion,
+                        nombre_bot: str, sl: float = None, tp: float = None) -> None:
+        orden = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": par,
+            "volume": volumen,
+            "type": tipo_operacion,
+            "magic": 202204,
+            "comment": nombre_bot,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK
+        }
+        if sl is not None: orden["sl"] = sl
+        if tp is not None: orden["tp"] = tp
+        res = mt5.order_send(orden)
+        if res.retcode != mt5.TRADE_RETCODE_DONE:
+            print(f"❌ Error al enviar orden: {res.retcode}, mensaje: {res.comment}")
         else:
-            modify_order_request = {
+            print(f"✅ Orden ejecutada. Ticket: {res.order}")
 
-            'action': mt5.TRADE_ACTION_SLTP,
-            'symbol':  symb,
-            'position': ticket ,
-            'type': type_order,
-            'tp': take_profit,
-            'sl': stop_loss,
-            'type_time': mt5.ORDER_TIME_GTC,
-            'type_filling': mt5.ORDER_FILLING_FOK
-                                    }
-
-            mt5.order_send(modify_order_request)
-    
-    def extract_data(self,par:str,periodo:mt5,cantidad:int) -> pd.DataFrame:
-        '''
-        Función para extraer los datos de MT5 y convertitlos en un DataFrame
-
-        # Parámetros 
-        
-        - par: Símbolo
-        - periodo: M1, M5...etc
-        - cantidad: Entero con el número de registros a extraer
-
-        '''
-        mt5.initialize(login = self.nombre, password = self.clave, server = self.servidor, path = self.path)
-        rates = mt5.copy_rates_from_pos(par, periodo, 0, cantidad)  
-        tabla = pd.DataFrame(rates)
-        tabla['time']=pd.to_datetime(tabla['time'], unit='s')
-        return tabla
-    
     def obtener_ordenes_pendientes(self) -> pd.DataFrame:
-        '''
-        Función para obtener órdenes pendientes.
-
-        '''
         try:
             ordenes = mt5.orders_get()
-            df = pd.DataFrame(list(ordenes), columns = ordenes[0]._asdict().keys())
-        except:
-            df = pd.DataFrame()
+            if not ordenes:
+                return pd.DataFrame()
+            return pd.DataFrame(list(ordenes), columns=ordenes[0]._asdict().keys())
+        except Exception:
+            return pd.DataFrame()
 
-        return df
-    
-    def remover_operacion_pendiente(self,nom_est:str) -> None:
-        '''
-        Función para remover las órdenes pendientes de una estrategia particular
-        '''
+    def remover_operacion_pendiente(self, nom_est: str) -> None:
         df = self.obtener_ordenes_pendientes()
-        df_estrategia = df[df['comment'] == nom_est]
-        ticket_list = df_estrategia['ticket'].unique().tolist()
-        for ticket in ticket_list:
-            close_pend_request = {
-                                    "action": mt5.TRADE_ACTION_REMOVE,
-                                    "order": ticket,
-                                    "type_filling": mt5.ORDER_FILLING_IOC
+        if df.empty: return
+        for ticket in df.loc[df['comment'] == nom_est, 'ticket'].unique().tolist():
+            req = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket, "type_filling": mt5.ORDER_FILLING_IOC}
+            mt5.order_send(req)
+
+    def close_all_open_operations(self, data: pd.DataFrame) -> None:
+        if data is None or data.empty:
+            return
+        for ticket in data['ticket'].unique().tolist():
+            row = data.loc[data['ticket'] == ticket].iloc[0]
+            symb = row['symbol']
+            vol  = row['volume']
+            side = row['type']  # 0=buy, 1=sell
+            close_type = mt5.ORDER_TYPE_SELL if side == 0 else mt5.ORDER_TYPE_BUY
+            req = {
+                'action': mt5.TRADE_ACTION_DEAL,
+                'symbol': symb,
+                'volume': vol,
+                'type': close_type,
+                'position': ticket,
+                'comment': 'Cerrar posiciones',
+                'type_filling': mt5.ORDER_FILLING_FOK
             }
+            mt5.order_send(req)
 
-            mt5.order_send(close_pend_request)
-
-    def open_operations(self,par:str,volumen: float,tipo_operacion:mt5,nombre_bot:str,sl:float= None,tp:float = None) -> None:
-        '''
-        Función para abrir operaciones en mt5. Esta funciónpuede abrir operaciones sin Stop Loss y sin Take Profit, solo con stop loss, solo con 
-        take profit o con ámbos parámetros.
-
-        # Parámetros
-
-        - par: Símbolo a extraer
-        - volumen: Lotaje de la operación
-        - tipo_operacion: mt5.ORDER_TYPE_BUY o mt5.ORDER_TYPE_BUY
-        - nombre_bot: Nombre de la estrategia que abre la operación
-
-        '''
-        if (sl == None) and (tp == None):
-
-            orden = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": par,
-            "volume": volumen,
-            "type": tipo_operacion,
-            "magic": 202204,
-            "comment": nombre_bot,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK
-
-            }
-
-            resultado = mt5.order_send(orden)
-            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
-            else:
-                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
-
-            print('Se ejecutó una',tipo_operacion, 'con un volumen de', volumen)
-        
-        elif (sl == None) and (tp != None):
-            orden = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": par,
-            "tp": tp,
-            "volume": volumen,
-            "type": tipo_operacion,
-            "magic": 202204,
-            "comment": nombre_bot,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK
-
-            }
-
-            resultado = mt5.order_send(orden)
-            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
-            else:
-                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
-            print('Se ejecutó una',tipo_operacion, 'con un volumen de', volumen)
-
-        elif (sl != None) and (tp == None):
-            orden = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": par,
-            "sl": sl,
-            "volume": volumen,
-            "type": tipo_operacion,
-            "magic": 202204,
-            "comment": nombre_bot,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK
-
-            }
-
-            resultado = mt5.order_send(orden)
-            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
-            else:
-                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
-        
-        elif (sl != None) and (tp != None):
-            orden = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": par,
-            "sl": sl,
-            "tp": tp,
-            "volume": volumen,
-            "type": tipo_operacion,
-            "magic": 202204,
-            "comment": nombre_bot,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK
-
-            }
-
-            resultado = mt5.order_send(orden)
-            if resultado.retcode != mt5.TRADE_RETCODE_DONE:
-                print(f"❌ Error al enviar orden: {resultado.retcode}, mensaje: {resultado.comment}")
-            else:
-                print(f"✅ Orden ejecutada con éxito. Ticket: {resultado.order}")
-            print('Se ejecutó una',tipo_operacion, 'con un volumen de', volumen)
-   
-    def close_all_open_operations(self,data:pd.DataFrame) -> None:
-        '''
-        Cierra todas las operaciones que estén contenidas en un dataframe.
-
-        # Parámetros
-
-        - par: Símbolo 
-        '''
-        
-        df_open_positions = data.copy()
-        lista_ops = df_open_positions['ticket'].unique().tolist()
-            
-
-        for operacion in lista_ops:
-            df_operacion = df_open_positions[df_open_positions['ticket'] == operacion]
-            price_close = df_operacion['price_current']
-            tipo_operacion = df_operacion['type'].item()
-            simbolo_operacion = df_operacion['symbol'].item()
-            volumen_operacion = df_operacion['volume'].item() 
-            # 1 Sell / 0 Buy
-            if tipo_operacion == 1:
-                tip_op = mt5.ORDER_TYPE_BUY
-                close_request = {
-                    'action': mt5.TRADE_ACTION_DEAL,
-                    'symbol':simbolo_operacion,
-                    'volume':volumen_operacion,
-                    'type': tip_op,
-                    'position': operacion,
-                    # 'price': price_close,
-                    'comment':'Cerrar posiciones',
-                    'type_filling': mt5.ORDER_FILLING_FOK
-                }
-                mt5.order_send(close_request)
-            if tipo_operacion == 0:
-                tip_op = mt5.ORDER_TYPE_SELL
-                close_request = {
-                    'action': mt5.TRADE_ACTION_DEAL,
-                    'symbol':simbolo_operacion,
-                    'volume':volumen_operacion,
-                    'type': tip_op,
-                    'position': operacion,
-                    # 'price': price_close,
-                    'comment':'Cerrar posiciones',
-                    'type_filling': mt5.ORDER_FILLING_FOK
-                }
-                mt5.order_send(close_request)
-   
-    def get_opened_positions(self,par:str = None) -> tuple:
-        '''
-        Función para obtener las posiciones abiertas para cada uno de los pares
-        en cada timeframe
-        
-        '''
-         
+    def get_opened_positions(self, par: Optional[str] = None):
         try:
-            #mt5.initialize( login = name, server = serv, password = key, path = path)
-            o_pos = mt5.positions_get()
-            df_pos = pd.DataFrame (list(o_pos), columns=o_pos[0]._asdict().keys())
-            if par == None:
-                df_pos_temp = df_pos
-            else:
-                df_pos_temp = df_pos[df_pos['symbol'] == par ]
-
-            len_d_pos = len(df_pos_temp)
-            print("Se logró obtener la historia correctamente")
-                
-                
-        except :
-            len_d_pos = 0
-            df_pos_temp = pd.DataFrame()
-            print("No se logró obtener la historia correctamente")
-                
-
-        return len_d_pos, df_pos_temp
+            pos = mt5.positions_get()
+            if not pos:
+                return 0, pd.DataFrame()
+            df = pd.DataFrame(list(pos), columns=pos[0]._asdict().keys())
+            if par:
+                df = df[df['symbol'] == par]
+            return len(df), df
+        except Exception:
+            return 0, pd.DataFrame()
 
     def get_all_positions(self) -> pd.DataFrame:
-        '''
-        Función para obtener las posiciones abiertas para cada uno de los pares en cada timeframe
-        '''
         try:
-            mt5.initialize( login = self.nombre, server = self.servidor, password = self.clave, path = self.path)
-            o_pos = mt5.positions_get()
-            df_pos = pd.DataFrame (list(o_pos), columns=o_pos[0]._asdict().keys())
-            print("Se logró obtener la historia correctamente")
-                
-        except :
-            df_pos = pd.DataFrame()
-            print("No se logró obtener la historia correctamente")
-        
-        return df_pos
+            pos = mt5.positions_get()
+            if not pos: return pd.DataFrame()
+            return pd.DataFrame(list(pos), columns=pos[0]._asdict().keys())
+        except Exception:
+            return pd.DataFrame()
 
-    def send_to_breakeven(self,df_pos:pd.DataFrame, perc_rec:float) -> None:
-        '''
-        Función para enviar a Break Even todas las posiciones de un dataframe
-
-        # Parámetros
-
-        - df_pos_temp : Dataframe con las operaciones que se desean llevar a break_even
-        - perc_recorrido: porcentaje de recorrido entre el precio de apertura y el TP para llevar la operación a BreakEven
-
-
-        '''
-        if df_pos.empty:
+    def send_to_breakeven(self, df_pos: pd.DataFrame, perc_rec: float) -> None:
+        """
+        Lleva a break-even las operaciones que ya recorrieron perc_rec% hacia su TP.
+        """
+        if df_pos is None or df_pos.empty:
             print('No hay operaciones abiertas')
-        else:
-            lista_operaciones = df_pos['ticket'].tolist()
-            for op in lista_operaciones:
-                df_temp = df_pos[df_pos['ticket'] == op]
-                symb = df_temp['symbol'].iloc[0]
-                ticket = op
-                stop_loss = df_temp['price_open'].iloc[0] #Esta variable es el precio de apertura stop_loss
-                take_profit = df_temp['tp'].iloc[0]
-                precio_actual = df_temp['price_current'].iloc[0]
-                tipo_operacion = df_temp['type'].iloc[0]
+            return
+        for ticket in df_pos['ticket'].tolist():
+            row = df_pos.loc[df_pos['ticket'] == ticket].iloc[0]
+            symb = row['symbol']
+            price_open = row['price_open']
+            tp = row['tp']
+            price_now = row['price_current']
+            side = row['type']  # 0=buy, 1=sell
+            # progreso hacia TP
+            if side == 0:  # buy
+                total = tp - price_open
+                done = price_now - price_open
+            else:          # sell
+                total = price_open - tp
+                done = price_open - price_now
+            if total <= 0: 
+                continue
+            progreso = (done / total) * 100.0
+            if progreso >= perc_rec:
+                # mueve SL a BE
+                type_order = mt5.ORDER_TYPE_BUY if side == 0 else mt5.ORDER_TYPE_SELL
+                self.modify_orders(symb, ticket, stop_loss=price_open, take_profit=tp, type_order=type_order)
 
-                if (tipo_operacion == 1) and (precio_actual < stop_loss):
-                    type_order = mt5.ORDER_TYPE_BUY
-                    self.modify_orders(symb,ticket,stop_loss,take_profit,type_order)
-                if (tipo_operacion == 0) and (precio_actual > stop_loss):
-                    type_order = mt5.ORDER_TYPE_SELL
-                    self.modify_orders(symb,ticket,stop_loss,take_profit,type_order)
-
-    def calculate_position_size(self,symbol:str, tradeinfo:float, per_to_risk:float) -> float:
-        '''
-        Función para calcular el lotaje óptimo dado un símbolo, una pérdida y un porcentaje de la cuenta que se desea arriesgar.
-
-        # Parámetros
-
-        - symbol: Simbolo
-        - tradeinfo: diferencia entre el precio de apertura y el sl en valor absoluto
-        - per_to_risk: Porcentaje de la cuenta a arriesgar en cada trade
-
-        '''
-        print(symbol)
-
+    def calculate_position_size(self, symbol: str, price_sl: float, risk_pct: float) -> float:
+        """
+        Calcula lotaje en función de distancia al SL y % de riesgo.
+        price_sl: precio del stop loss
+        risk_pct: 0.02 => 2%
+        """
         mt5.symbol_select(symbol, True)
-        symbol_info_tick = mt5.symbol_info_tick(symbol)
-        symbol_info = mt5.symbol_info(symbol)
-
-        current_price = (symbol_info_tick.bid + symbol_info_tick.ask) / 2
-        sl = tradeinfo
-        tick_size = symbol_info.trade_tick_size
-
+        sym_tick = mt5.symbol_info_tick(symbol)
+        sym_info = mt5.symbol_info(symbol)
+        if sym_tick is None or sym_info is None:
+            return 0.01
+        mid = (sym_tick.bid + sym_tick.ask) / 2
+        tick_size = sym_info.trade_tick_size
+        tick_value = sym_info.trade_tick_value
         balance = mt5.account_info().balance
-        risk_per_trade = per_to_risk
-        ticks_at_risk = abs(current_price - sl) / tick_size
-        tick_value = symbol_info.trade_tick_value
+        ticks_at_risk = abs(mid - price_sl) / max(tick_size, 1e-12)
+        if ticks_at_risk <= 0 or tick_value <= 0:
+            return 0.01
+        pos_size = (balance * risk_pct) / (ticks_at_risk * tick_value)
+        return round(max(pos_size, 0.01), 2)
 
-        position_size = (balance * risk_per_trade) / (ticks_at_risk * tick_value)
-        position_size = round(max(position_size, 0.01), 2)
-        return position_size
-
-
-        return position_size
-    
+    # ---------- calendario (web scraping sencillo) ----------
     def get_today_calendar(self) -> pd.DataFrame:
-        """Regresa un Dataframe con la información de las noticias del día contiene las columnas del simbolo y la intensidad"""
-        
+        """Regresa un DataFrame con columnas: currency, time, intensity (0..3)"""
         r = Request('https://es.investing.com/economic-calendar/', headers={'User-Agent': 'Mozilla/5.0'})
-        #r = Request('https://br.investing.com/economic-calendar/')
         response = urlopen(r).read()
         soup = BeautifulSoup(response, "html.parser")
-        table = soup.find_all(class_ = "js-event-item")
-
-        result = []
+        table = soup.find_all(class_="js-event-item")
         base = {}
-
         for bl in table:
-            time = bl.find(class_ ="first left time js-time").text
-            # evento = bl.find(class_ ="left event").text
-            currency = bl.find(class_ ="left flagCur noWrap").text.split(' ')
-            intensity = bl.find_all(class_="left textNum sentiment noWrap")
-            id_hour = currency[1] + '_' + time
-
-            if not id_hour in base:
-                #base.update({id_hour : {'currency' : currency[1], 'time' : time,'intensity' : { "1": 0,"2": 0,"3": 0} } })
-                base.update({id_hour : {'currency' : currency[1], 'time' : time,'intensity' : 0 }})
-
-            #intencity = base[id_hour]['intensity']
-            intencity = 0
-
-
-            for intence in intensity:
-                _true = intence.find_all(class_="grayFullBullishIcon")
-                _false = intence.find_all(class_="grayEmptyBullishIcon")
-
-                if len(_true) == 1:
-                    #intencity['1'] += 1
-                    intencity = 1
-
-                elif len(_true) == 2:
-                    # intencity['2'] += 1
-                    intencity = 2
-
-                elif len(_true) == 3:
-                    #intencity['3'] += 1
-                    intencity = 3
-
-            base[id_hour].update({'intensity' : intencity})
-
-        for b in base:
-            result.append(base[b])
-
-        news = pd.DataFrame.from_records(result)
-
-        return news
-    
-    def get_data_for_bt(self,timeframe,symbol,cantidad):
-
-        mt5.initialize( login = self.nombre, server = self.servidor, password = self.clave, path = self.path)
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, cantidad)
-        rates_frame = pd.DataFrame(rates)
-        rates_frame['time']=pd.to_datetime(rates_frame['time'], unit='s')
-        data = rates_frame.copy()
-        data = data.iloc[:,[0,1,2,3,4,5,7]]
-        data.columns = ['time','Open','High','Low','Close','Volume','OpenInterest']
-        data = data.set_index('time')
-
-        return data
-    
-    def info_account(self) -> tuple:
-
-        '''Función que retorna una tupla con el balance, el profit actual, la equidad y el margen libre de la cuenta'''
-
-        mt5.initialize(path = self.path, login = self.nombre,password = self.clave, server= self.servidor)
-        cuentaDict = mt5.account_info()._asdict()
-        balance = cuentaDict["balance"]
-        profit_account = cuentaDict["profit"]
-        equity = cuentaDict["equity"]
-        free_margin = cuentaDict["margin_free"]
-
-        return balance, profit_account, equity, free_margin
-
-    def get_data_from_dates(self,year_ini,month_ini,day_ini,year_fin,month_fin,day_fin,symbol,timeframe, for_bt = False) -> pd.DataFrame:
-        from_date = datetime(year_ini, month_ini, day_ini)
-        to_date = datetime(year_fin, month_fin, day_fin)
-        rates = mt5.copy_rates_range(symbol, timeframe, from_date, to_date)
-        rates_frame = pd.DataFrame(rates)
-        rates_frame['time']=pd.to_datetime(rates_frame['time'], unit='s')
-
-        if for_bt == True:
-            rates_frame = rates_frame.iloc[:,[0,1,2,3,4,5,7]]
-            rates_frame.columns = ['time','Open','High','Low','Close','Volume','OpenInterest']
-            rates_frame = rates_frame.set_index('time')
-        
-        return rates_frame
+            try:
+                time = bl.find(class_="first left time js-time").text.strip()
+                currency = bl.find(class_="left flagCur noWrap").text.split(' ')[1]
+                full = bl.find_all(class_="left textNum sentiment noWrap")
+                intensity = 0
+                for ele in full:
+                    bulls = ele.find_all(class_="grayFullBullishIcon")
+                    if len(bulls) == 1: intensity = max(intensity, 1)
+                    elif len(bulls) == 2: intensity = max(intensity, 2)
+                    elif len(bulls) == 3: intensity = max(intensity, 3)
+                base[f"{currency}_{time}"] = {"currency": currency, "time": time, "intensity": intensity}
+            except Exception:
+                continue
+        return pd.DataFrame.from_dict(base, orient="index").reset_index(drop=True)

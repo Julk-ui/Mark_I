@@ -1,20 +1,20 @@
 # === Configuración General ===
 simbolo: "EURUSD"
-timeframe: "M5"
-cantidad_datos: 2000
+timeframe: "D1"                  # ← barras diarias
+cantidad_datos: 2000             # ← ~8 años (2000 días hábiles aprox.) para tener buen histórico
 
 # Modelo activo
-modelo: "prophet"
-pasos_prediccion: 100           # pasos a predecir (p. ej., 12 para ~1h en M5)
-frecuencia_prediccion: "5min"
-umbral_senal: 0.0005            # ~5 pips en EURUSD
+modelo: "auto"                   # "prophet" o "auto" (comparativo RW/ARIMA/ETS/LSTM/Prophet si está disponible)
+pasos_prediccion: 20             # ← ~1 mes de trading (20 días hábiles)
+frecuencia_prediccion: "1D"      # ← predicción a 1 día
+umbral_senal: 0.0010             # ← ~10 pips en EURUSD para señales diarias
 
 # === Parámetros de Trading ===
-riesgo_por_trade: 0.02          # 2% del balance
-volumen_minimo: 0.01            # lotaje mínimo
-stop_loss_pips: 10
-take_profit_pips: 20
-pip_size: 0.0001                # si lo omites, se infiere con mt5.symbol_info
+riesgo_por_trade: 0.02
+volumen_minimo: 0.01
+stop_loss_pips: 100              # (diario suele requerir SL/TP mayores que en M5)
+take_profit_pips: 200
+pip_size: 0.0001
 
 # === Reportes ===
 ruta_reporte: "outputs/reporte_inversion.xlsx"
@@ -22,22 +22,20 @@ ruta_reporte: "outputs/reporte_inversion.xlsx"
 # === EDA (CRISP-DM) ===
 eda:
   habilitar: true
-  frecuencia_resampleo: "D"         # o "D", "15T", etc.
+  frecuencia_resampleo: "D"      # ← EDA en diario
   outdir: "outputs/eda"
   ventana_media_movil: 30
-  acf_lags: 40
-  rolling_vol_windows: [20,60,120]
-  rolling_corr_window: 60
+  acf_lags: 60                   # ← un poco más largo en diario
+  rolling_vol_windows: [20, 60, 120]
+  rolling_corr_window: 120       # ← 6 meses en diario
   export_pdf: true
   pdf_filename: "EDA_informe.pdf"
   alias_eur: "EURUSD"
-  alias_spy: "US500"                 # si usas .US500Cash en MT5
+  alias_spy: "US500"
 
 # === SPY para EDA (elige UNA opción) ===
-# Opción A (si tu broker lo ofrece):
-simbolo_spy: ".US500Cash"  # o el símbolo que uses para SPY en tu broker
-# Opción B (si no existe en tu broker, usar CSV):
-# spy_csv: "data/spy.csv"       # columnas mínimas: timestamp, Close
+simbolo_spy: ".US500Cash"
+# spy_csv: "data/spy.csv"
 
 # === Credenciales / terminal MT5 ===
 mt5:

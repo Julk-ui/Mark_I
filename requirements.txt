@@ -1,30 +1,33 @@
-# --- Núcleo de datos / modelado ---
-pandas>=1.5
-numpy<2.0
-scikit-learn>=1.0
-scipy>=1.10
-statsmodels>=0.14
+# Núcleo científico
+numpy>=1.24
+pandas>=2.0
+scipy>=1.11
 
-# --- Visualización ---
-matplotlib>=3.5
+# Modelado clásico
+statsmodels>=0.14     # ARIMA/ETS, OLS (HAR)
 
-# --- Prophet (forecasting) ---
-prophet==1.1.5
-cmdstanpy>=1.1.0    # ayuda a Prophet a gestionar CmdStan; se descargará al primer uso
+# ML / escalado
+scikit-learn>=1.3
 
-# --- MT5 / I/O / utilidades ---
-MetaTrader5==5.0.44
-requests>=2.28
-beautifulsoup4>=4.9
+# LSTM (opcional; se omite si no está disponible)
+tensorflow>=2.16 ; platform_system!="Linux" or python_version>="3.10"
+
+# Volatilidad
+arch>=6.2             # GARCH(1,1)
+
+# Gráficos
+matplotlib>=3.8
+
+# Configuración
 PyYAML>=6.0
 
-# --- Excel ---
-openpyxl>=3.0
-xlsxwriter>=3.0     # opcional: si no lo quieres, quítalo (hay fallback a openpyxl)
+# Prophet (opcional para modo "prophet" y para competir en "auto")
+prophet>=1.1.5
+cmdstanpy>=1.2
 
-# --- Indicadores técnicos (si usas funciones externas de 'ta') ---
-ta==0.10.2
+# MetaTrader 5 (solo Windows)
+MetaTrader5>=5.0 ; platform_system=="Windows"
 
-# --- (Opcional) LSTM ---
-# Si usarás lstm_adapter.py, instala TensorFlow CPU (más portable que GPU en Windows)
-tensorflow-cpu==2.15.*
+# Utilidades extra usadas
+beautifulsoup4>=4.12  # calendario (scraping sencillo)
+openpyxl>=3.1         # exportar a Excel (ruta_reporte)
