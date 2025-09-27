@@ -436,6 +436,26 @@ def plot_vol_preds(vol_df: pd.DataFrame, out_path: str):
     plt.legend(); plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path); plt.close()
+    
+def plot_level_preds_simple(df: pd.DataFrame, out_path: str, title: str = "Precio real vs predicciones"):
+    plt.figure(figsize=(10,5))
+    plt.plot(df.index, df["y"], label="Real", linewidth=2)
+    for c in [c for c in df.columns if c!="y"]:
+        plt.plot(df.index, df[c], label=c.upper(), alpha=0.9)
+    plt.title(title); plt.legend(); plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
+def plot_trend_simple(price: pd.Series, out_path: str, windows=(20,60)):
+    plt.figure(figsize=(10,4))
+    plt.plot(price.index, price.values, label="Precio", linewidth=1.5)
+    for w in windows:
+        plt.plot(price.index, price.rolling(w).mean(), label=f"MA{w}")
+    plt.title("Tendencia (medias móviles)")
+    plt.legend(); plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
 
 
 # ==================== HELPERS MT5 ====================
@@ -455,7 +475,7 @@ def obtener_df_desde_mt5(bf: Basic_funcs, symbol: str, timeframe: str, n_barras:
 def main():
     # --- Config / CLI ---
     parser = argparse.ArgumentParser()
-    parser.add_argument("--modo", choices=["normal","eda","modelos"], default="normal")
+    parser.add_argument("--modo", choices=["normal","eda","modelos","simple"], default="normal")
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
@@ -562,6 +582,131 @@ def main():
             else:
                 ejecutar_eda(df_eurusd=df, df_spy=None, cfg=config)
             return
+        
+        # ---------- MODO: SIMPLE (backtest 1 split, métricas y gráficos básicos) ----------
+        if args.modo == "simple":
+            # Parámetros: usa YAML o valores sensatos
+            pasos_test = int(config.get("pasos_test", max(200, int(0.25*len(price)))))
+            outdir_simple = os.path.join(eda_cfg.get("outdir","outputs/eda"), simbolo, "simple")
+            os.makedirs(outdir_simple, exist_ok=True)
+
+            # Split
+            assert pasos_test < len(price), "pasos_test debe ser menor que el total"
+            train = price.iloc[:-pasos_test]
+            test  = price.iloc[-pasos_test:]
+            test_idx = test.index
+
+            # Baseline
+            rw = predict_random_walk(price, horizon=1).reindex(test_idx)
+
+            # ARIMA (usa tu fit_arima_series actual)
+            ar_fit = fit_arima_series(train, order=(1,1,1))
+            ar_pred = arima_forecast_steps(ar_fit, steps=len(test_idx), index=test_idx)
+
+            # ETS sencillo
+            ets_fit = fit_ets_series(train, trend="add", seasonal=None)
+            ets_pred = ets_forecast_steps(ets_fit, steps=len(test_idx), index=test_idx)
+
+            # LSTM (si está disponible)
+            lstm_pred = None
+            if _TF_OK:
+                try:
+                    lstm_state = train_lstm_returns(train, window=22, epochs=20, batch=32)
+                    lstm_pred = lstm_predict_price(lstm_state, price).reindex(test_idx)
+                except Exception as e:
+                    print(f"⚠️ LSTM omitido (simple) ({e}).")
+                    
+                        # Prophet (opcional) — simple y alineado al resto
+            prophet_pred = None
+            if _PROPHET_OK:
+                try:
+                    # Prophet requiere dataframe con columnas ds (fecha) e y (valor)
+                    dfp = train.reset_index()
+                    dfp.columns = ["ds", "y"]  # asegurar nombres
+                    mprop = entrenar_modelo_prophet(dfp)
+                    # Pronostica exactamente el largo del test, frecuencia diaria 'D' en D1
+                    # (Si tu timeframe es M5, usa '5min'; aquí, en D1, 'D' es lo natural)
+                    freq = "D" if timeframe.upper()=="D1" else "5min"
+                    fc = predecir_precio(mprop, pasos=len(test_idx), frecuencia=freq)
+                    prophet_pred = pd.Series(fc["yhat"].values, index=test_idx, name="prophet")
+                except Exception as e:
+                    print(f"⚠️ Prophet omitido (simple) ({e}).")
+
+
+            # Consolidar
+            cols = {"y": test, "rw": rw, "arima": ar_pred, "ets": ets_pred}
+            if prophet_pred is not None:cols["prophet"] = prophet_pred
+            if lstm_pred is not None: cols["lstm"] = lstm_pred
+            df_simple = pd.DataFrame(cols).dropna()
+
+            # Métricas simples
+            def _rmse(a,b): return float(np.sqrt(np.mean((np.asarray(a)-np.asarray(b))**2)))
+            def _mae(a,b):  return float(np.mean(np.abs(np.asarray(a)-np.asarray(b))))
+            def _mape(a,b):
+                a = np.asarray(a); b = np.asarray(b)
+                denom = np.where(np.abs(a)<1e-12, 1e-12, np.abs(a))
+                return float(np.mean(np.abs((a-b)/denom))*100)
+            def _theils(y, p):
+                y = pd.Series(y); p = pd.Series(p).reindex_like(y)
+                e = (p - y).values
+                dy = np.diff(y.values, prepend=y.values[0])
+                denom = np.sum(dy[1:]**2)
+                return float(np.sqrt(np.sum(e[1:]**2)/(denom+1e-12)))
+            def _hit(y,p):
+                y = pd.Series(y); p = pd.Series(p).reindex_like(y)
+                return float((np.sign(y.diff().dropna())==np.sign(p.diff().reindex(y.index).dropna())).mean())
+
+            rows = []
+            for m in [c for c in df_simple.columns if c!="y"]:
+                rows.append({
+                    "model": m,
+                    "RMSE": _rmse(df_simple["y"], df_simple[m]),
+                    "MAE": _mae(df_simple["y"], df_simple[m]),
+                    "MAPE(%)": _mape(df_simple["y"], df_simple[m]),
+                    "TheilsU": _theils(df_simple["y"], df_simple[m]),
+                    "HitRate": _hit(df_simple["y"], df_simple[m]),
+                })
+            metr_simple = pd.DataFrame(rows).set_index("model").sort_values(["RMSE","TheilsU"])
+
+            # DM vs RW
+            dm_simple = {}
+            for m in metr_simple.index:
+                if m == "rw": continue
+                dm_simple[m] = diebold_mariano(df_simple["y"], df_simple[m], df_simple["rw"], h=1, loss="mse")
+
+            # Gráficos básicos
+            nivel_img = os.path.join(outdir_simple, "nivel_pred_vs_real.png")
+            plot_level_preds_simple(df_simple, nivel_img)
+            trend_img = os.path.join(outdir_simple, "tendencia_ma.png")
+            plot_trend_simple(price, trend_img)
+
+            # Guardar CSV
+            df_simple.to_csv(os.path.join(outdir_simple, "predicciones_simple.csv"))
+            metr_simple.to_csv(os.path.join(outdir_simple, "metricas_simple.csv"))
+
+            # Reportes: Excel/PDF simples (se suman al “completo”, no lo sustituyen)
+            from reportes.reportes_excel import export_excel_simple
+            from reportes.reportes_pdf import generate_pdf_simple
+            ruta_xlsx = config.get("ruta_reporte", os.path.join("outputs","reporte_inversion.xlsx")).replace(".xlsx","_simple.xlsx")
+            export_excel_simple(
+                ruta_excel=ruta_xlsx,
+                metricas_df=metr_simple,
+                dm_dict=dm_simple,
+                preds_df=df_simple,
+                config={"simbolo": simbolo, "timeframe": timeframe, "pasos_test": pasos_test, "modo":"simple", "outdir": outdir_simple}
+            )
+            print(f"💾 Excel simple: {ruta_xlsx}")
+
+            ruta_pdf = config.get("ruta_pdf", os.path.join("outputs","reporte_inversion.pdf")).replace(".pdf","_simple.pdf")
+            generate_pdf_simple(
+                output_pdf_path=ruta_pdf,
+                image_paths=[nivel_img, trend_img],
+                title="Informe de Resultados — Modo Simple",
+                metadata={"simbolo": simbolo, "timeframe": timeframe, "pasos_test": pasos_test, "modo":"simple", "outdir": outdir_simple}
+            )
+            print(f"📄 PDF simple: {ruta_pdf}")
+            return
+
 
         # ---------- MODO: NORMAL (trading) ----------
         if modelo_str == "prophet":

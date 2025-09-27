@@ -1,109 +1,193 @@
 # modelos/evaluacion_modelos.py
+# Evaluación simple y clara: backtest de 1 split + walk-forward opcional,
+# métricas comprensibles, DM vs baseline y gráficos básicos.
+
+import os
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+from scipy import stats
 
-def compute_metrics_prophet(
-    df_indicadores: pd.DataFrame,
-    predicciones_live: pd.DataFrame,
-    pasos_pred: int,
-    frecuencia_pred: str,
-    simbolo: str,
-    timeframe_str: str,
-    modelo_str: str,
-    entrenar_fn,      # callable(df_train) -> modelo
-    predecir_fn       # callable(modelo, pasos, frecuencia) -> df_pred
-) -> dict:
+# ===== Métricas básicas =====
+def rmse(y_true, y_pred):
+    e = np.asarray(y_true) - np.asarray(y_pred)
+    return float(np.sqrt(np.mean(e**2)))
+
+def mae(y_true, y_pred):
+    return float(np.mean(np.abs(np.asarray(y_true) - np.asarray(y_pred))))
+
+def mape(y_true, y_pred):
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
+    denom = np.where(np.abs(y_true) < 1e-12, 1e-12, np.abs(y_true))
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
+
+def theils_u(y_true: pd.Series, y_pred: pd.Series) -> float:
     """
-    Backtest simple: entrena con todo menos los últimos 'pasos_pred' y predice esos pasos
-    para comparar vs valores reales. Calcula métricas + horizonte (desde predicciones live).
+    Relativo a un random walk: <1 mejora, 1 igual, >1 peor.
+    Implementación simple: compara el error vs diferencias de y_true.
     """
+    y_true = pd.Series(y_true).astype(float)
+    y_pred = pd.Series(y_pred).astype(float).reindex_like(y_true)
+    e = (y_pred - y_true).values
+    dy = np.diff(y_true.values, prepend=y_true.values[0])
+    denom = np.sum(dy[1:]**2)
+    return float(np.sqrt(np.sum(e[1:]**2) / (denom + 1e-12)))
 
-    # >>> Aseguramos columna Close y orden temporal (por si viene desordenado)
-    assert 'Close' in df_indicadores.columns, "df_indicadores debe contener la columna 'Close'"
-    if not df_indicadores.index.is_monotonic_increasing:
-        df_indicadores = df_indicadores.sort_index()
+def hit_rate(y_true: pd.Series, y_pred: pd.Series) -> float:
+    """
+    % de aciertos en la DIRECCIÓN (sube/baja).
+    """
+    yt = pd.Series(y_true).astype(float)
+    yp = pd.Series(y_pred).astype(float).reindex_like(yt)
+    dir_t = np.sign(yt.diff()).dropna()
+    dir_p = np.sign(yp.diff()).reindex(dir_t.index).dropna()
+    return float((dir_t == dir_p).mean())
 
-    # >>> Validaciones de tamaño
-    pasos_pred = int(pasos_pred)
-    assert pasos_pred > 0, "pasos_pred debe ser > 0"
-    assert len(df_indicadores) > pasos_pred, "df_indicadores debe tener más filas que pasos_pred"
+def diebold_mariano(y_true: pd.Series, y1: pd.Series, y2: pd.Series, h: int = 1, loss: str = "mse") -> dict:
+    """
+    DM test: compara y1 contra y2 (p.ej., modelo vs baseline).
+    - loss='mse' o 'mae'
+    """
+    y_true = pd.Series(y_true).astype(float)
+    y1 = pd.Series(y1).reindex_like(y_true).astype(float)
+    y2 = pd.Series(y2).reindex_like(y_true).astype(float)
 
-    # Split
-    df_train = df_indicadores.iloc[:-pasos_pred].copy()
-    df_test  = df_indicadores.iloc[-pasos_pred:].copy()
-
-    # Entrenar & predecir backtest
-    modelo_bt = entrenar_fn(df_train)
-    preds_bt  = predecir_fn(modelo_bt, pasos=pasos_pred, frecuencia=frecuencia_pred)
-
-    # >>> Validación de salida de predicción
-    assert isinstance(preds_bt, pd.DataFrame), "predecir_fn debe devolver un DataFrame"
-    assert 'precio_estimado' in preds_bt.columns, "preds_bt debe tener la columna 'precio_estimado'"
-    assert len(preds_bt) >= len(df_test), "preds_bt debe tener al menos pasos_pred filas"
-
-    # Alinear tamaños
-    y_true = df_test['Close'].astype(float).values
-    y_pred = preds_bt['precio_estimado'].astype(float).values[:len(y_true)]
-
-    # Errores (métricas)
-    mae  = mean_absolute_error(y_true, y_pred)
-    rmse = mean_squared_error(y_true, y_pred, squared=False)
-
-    # >>> MAPE robusto a ceros en y_true
-    eps = 1e-12
-    denom = np.where(np.abs(y_true) < eps, eps, np.abs(y_true))
-    mape = float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
-
-    r2   = r2_score(y_true, y_pred)
-
-    # Sortino (retornos de predicción vs real)
-    returns = (y_pred - y_true) / np.where(np.abs(y_true) < eps, eps, y_true)
-    downside = returns[returns < 0]
-    downside_std = float(np.std(downside)) if downside.size > 0 else np.nan
-    risk_free = 0.0
-    sortino = float((np.mean(returns) - risk_free) / downside_std) if (downside_std not in [0.0, np.nan]) else np.nan
-
-    # Accuracy direccional (robusto a series cortas)
-    if len(y_true) >= 2 and len(y_pred) >= 2:
-        dir_real = np.sign(np.diff(y_true))
-        dir_pred = np.sign(np.diff(y_pred))
-        # >>> Igualar longitudes por seguridad
-        n = min(len(dir_real), len(dir_pred))
-        aciertos = int(np.sum(dir_real[:n] == dir_pred[:n]))
-        total    = int(n)
-        accuracy_dir = float(aciertos / total) if total > 0 else np.nan
+    if loss=="mse":
+        d = (y_true - y1)**2 - (y_true - y2)**2
     else:
-        accuracy_dir = np.nan
+        d = (y_true - y1).abs() - (y_true - y2).abs()
+    d = d.dropna(); T = len(d)
+    if T < 10:
+        return {"DM": np.nan, "p_value": np.nan, "T": int(T)}
 
-    # Horizonte (desde las predicciones live del bot)
-    # >>> Robusto a DataFrame vacío o sin columna esperada
-    if isinstance(predicciones_live, pd.DataFrame) and 'timestamp_prediccion' in predicciones_live.columns and len(predicciones_live) > 0:
-        tmax = predicciones_live['timestamp_prediccion'].max()
-        tmin = predicciones_live['timestamp_prediccion'].min()
-        if pd.isna(tmax) or pd.isna(tmin):
-            horizonte_dias = 0
-            horizonte_horas_totales = 0.0
-        else:
-            horizonte = tmax - tmin
-            horizonte_dias = int(getattr(horizonte, 'days', 0))
-            horizonte_horas_totales = float(getattr(horizonte, 'total_seconds', lambda: 0)() / 3600)
-    else:
-        horizonte_dias = 0
-        horizonte_horas_totales = 0.0
+    dbar = d.mean()
+    def acov(x,k): return np.cov(x[k:], x[:-k], bias=True)[0,1] if k>0 else np.var(x, ddof=0)
+    s = acov(d.values,0)
+    for k in range(1,h): s += 2*(1-k/h)*acov(d.values,k)
+    var_dbar = s / T
+    DM = dbar / np.sqrt(var_dbar + 1e-12)
+    p = 2*(1 - stats.t.cdf(np.abs(DM), df=T-1))
+    return {"DM": float(DM), "p_value": float(p), "T": int(T)}
 
-    return {
-        'Fecha': pd.Timestamp.now(),
-        'Simbolo': simbolo,
-        'Timeframe': timeframe_str,
-        'Modelo': modelo_str,
-        'Pasos_pred': int(pasos_pred),
-        'MAE': float(mae),
-        'RMSE': float(rmse),
-        'MAPE_%': float(mape),
-        'R2': float(r2),
-        'Sortino': float(sortino) if not np.isnan(sortino) else np.nan,
-        'Accuracy_direccional': float(accuracy_dir) if not np.isnan(accuracy_dir) else np.nan,
-        'Horizonte_dias': int(horizonte_dias),
-        'Horizonte_horas_totales': float(horizonte_horas_totales)
-    }
+# ===== Gráficos simples =====
+def plot_level_preds(df: pd.DataFrame, out_path: str, title: str = "Precio real vs predicciones"):
+    """
+    df con columnas: 'y' (real) y modelos ('rw','arima','ets','lstm'…).
+    """
+    plt.figure(figsize=(10,5))
+    plt.plot(df.index, df["y"], label="Real", linewidth=2)
+    for c in [c for c in df.columns if c!="y"]:
+        plt.plot(df.index, df[c], label=c.upper(), alpha=0.9)
+    plt.title(title); plt.legend(); plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
+def plot_trend(price: pd.Series, out_path: str, windows=(20,60)):
+    """
+    Muestra la serie y medias móviles (tendencia) para contexto visual.
+    """
+    plt.figure(figsize=(10,4))
+    plt.plot(price.index, price.values, label="Precio", linewidth=1.5)
+    for w in windows:
+        plt.plot(price.index, price.rolling(w).mean(), label=f"MA{w}")
+    plt.title("Tendencia (medias móviles)")
+    plt.legend(); plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path); plt.close()
+
+# ===== Backtests =====
+def backtest_un_split(price: pd.Series, pasos_test: int,
+                      fit_funcs: dict, forecast_funcs: dict,
+                      outdir: str) -> dict:
+    """
+    Un solo split (train|test) para simplicidad.
+    - fit_funcs: {'arima': callable, 'ets': callable, 'lstm': callable?}
+    - forecast_funcs: {'arima': callable, ...} que reciban (fit, steps, index)
+    Devuelve df con predicciones y tabla de métricas + DM vs RW.
+    """
+    price = price.dropna()
+    assert pasos_test < len(price), "pasos_test debe ser menor que el total"
+    train = price.iloc[:-pasos_test]
+    test  = price.iloc[-pasos_test:]
+    test_idx = test.index
+
+    # Baseline
+    from modelos.baseline import predict_random_walk
+    preds = {"rw": predict_random_walk(price, 1).reindex(test_idx)}
+
+    # Modelos
+    if "arima" in fit_funcs:
+        ar_fit = fit_funcs["arima"](train)
+        preds["arima"] = forecast_funcs["arima"](ar_fit, steps=len(test_idx), index=test_idx)
+    if "ets" in fit_funcs:
+        ets_fit = fit_funcs["ets"](train)
+        preds["ets"] = forecast_funcs["ets"](ets_fit, steps=len(test_idx), index=test_idx)
+    if "lstm" in fit_funcs:
+        try:
+            lstm_state = fit_funcs["lstm"](train)
+            preds["lstm"] = forecast_funcs["lstm"](lstm_state, price).reindex(test_idx)
+        except Exception as e:
+            print(f"⚠️ LSTM omitido ({e}).")
+
+    # Tabla consolidada
+    df = pd.concat([test.rename("y")] + [p.rename(k) for k,p in preds.items()], axis=1).dropna()
+
+    # Métricas por modelo
+    rows = []
+    for m in [c for c in df.columns if c!="y"]:
+        rows.append({
+            "model": m,
+            "RMSE": rmse(df["y"], df[m]),
+            "MAE": mae(df["y"], df[m]),
+            "MAPE(%)": mape(df["y"], df[m]),
+            "TheilsU": theils_u(df["y"], df[m]),
+            "HitRate": hit_rate(df["y"], df[m])
+        })
+    met = pd.DataFrame(rows).set_index("model").sort_values(["RMSE","TheilsU"])
+
+    # DM vs RW
+    dm = {}
+    for m in met.index:
+        if m != "rw":
+            dm[m] = diebold_mariano(df["y"], df[m], df["rw"], h=1, loss="mse")
+
+    # Gráficos (predicciones + tendencia)
+    os.makedirs(outdir, exist_ok=True)
+    plot_level_preds(df, os.path.join(outdir, "nivel_pred_vs_real.png"))
+    plot_trend(price, os.path.join(outdir, "tendencia_ma.png"))
+
+    # Persistir CSVs simples
+    df.to_csv(os.path.join(outdir, "predicciones_nivel.csv"))
+    met.to_csv(os.path.join(outdir, "metricas_nivel.csv"))
+
+    return {"preds": df, "metrics": met, "dm": dm}
+
+def walk_forward_simple(price: pd.Series, horizon: int, n_splits: int = 5,
+                        fit_funcs: dict = None, forecast_funcs: dict = None) -> pd.DataFrame:
+    """
+    Walk-forward muy simple: repite n_splits con una ventana creciente y
+    test de longitud 'horizon'. Devuelve un DataFrame con métricas promedio.
+    (Úsalo cuando quieras reportar medias/intervalos).
+    """
+    if fit_funcs is None or forecast_funcs is None:
+        return pd.DataFrame()
+
+    chunks = []
+    N = len(price)
+    min_train = max(200, int(0.6*N))
+    step = max(horizon, int(0.1*N))
+    i = min_train
+    for s in range(n_splits):
+        tr = price.iloc[:i]
+        te = price.iloc[i:i+horizon]
+        if len(te) < horizon: break
+        res = backtest_un_split(price.iloc[:i+horizon], pasos_test=horizon,
+                                fit_funcs=fit_funcs, forecast_funcs=forecast_funcs,
+                                outdir=os.path.join("outputs","eda","WF_tmp"))
+        metr = res["metrics"].assign(split=s)
+        chunks.append(metr.reset_index())
+        i += step
+    if not chunks:
+        return pd.DataFrame()
+    all_m = pd.concat(chunks, ignore_index=True)
+    return all_m.groupby("model").agg(["mean","std"])

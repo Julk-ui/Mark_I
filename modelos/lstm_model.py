@@ -1,15 +1,17 @@
+# modelos/lstm_model.py
+# LSTM minimalista sobre RETORNOS (log-diff), re-integrando a precio.
+# Si TensorFlow no está disponible, captura el error en quien lo invoque.
+
 import numpy as np
 import pandas as pd
 from typing import Tuple
 from sklearn.preprocessing import StandardScaler
-
-# TensorFlow es opcional; si no está, puedes envolver el train/predict en try/except.
 from tensorflow import keras
 
 def _supervised(series: pd.Series, window: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Convierte una serie en dataset supervisado con ventana 'window'.
-    Retorna X:(N,window,1) y y:(N,1)
+    Construye dataset supervisado con ventana 'window'.
+    X: (N, window, 1), y: (N, 1)
     """
     x, y = [], []
     s = series.values.astype("float32")
@@ -20,10 +22,11 @@ def _supervised(series: pd.Series, window: int) -> Tuple[np.ndarray, np.ndarray]
     y = np.array(y)[:, None]
     return X, y
 
-def train_lstm_returns(price: pd.Series, window: int = 22, epochs: int = 30, batch: int = 32):
+def train_lstm_returns(price: pd.Series, window: int = 22, epochs: int = 20, batch: int = 32):
     """
-    Entrena LSTM sobre RETORNOS (log-diff) y luego reconstruye el nivel.
-    Más estable que modelar el nivel directo.
+    Entrena LSTM sobre RETORNOS (log-diff). Suele ser más estable que niveles.
+    - window: tamaño de ventana (22~1 mes de trading en D1).
+    - epochs: pocas (queremos simple/rápido).
     """
     r = np.log(price).diff().dropna()
     scaler = StandardScaler()
@@ -43,8 +46,8 @@ def train_lstm_returns(price: pd.Series, window: int = 22, epochs: int = 30, bat
 
 def lstm_predict_price(state, price: pd.Series) -> pd.Series:
     """
-    Usa el estado entrenado para predecir el siguiente retorno y reconstruir el precio.
-    Devuelve una serie alineada con el índice de entrada (últimos puntos).
+    Predice el siguiente retorno estandarizado y lo re-integra a nivel de precio.
+    Devuelve una serie alineada con el final de 'price'.
     """
     scaler = state["scaler"]; W = state["window"]; model = state["model"]
     r = np.log(price).diff().dropna()

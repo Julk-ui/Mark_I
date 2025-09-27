@@ -62,3 +62,43 @@ def generate_pdf_report(
             ax.set_title(os.path.basename(p), fontsize=12)
             ax.axis("off")
             pdf.savefig(fig); plt.close(fig)
+
+# === PDF simple (portada + imágenes) ===
+def generate_pdf_simple(
+    output_pdf_path: str,
+    image_paths: list[str],
+    title: str = "Informe de Resultados — Modo Simple",
+    metadata: dict | None = None,
+):
+    """
+    Versión mínima del informe:
+      - Portada con metadatos esenciales
+      - 1 página por imagen (sin leyenda adicional)
+    No reemplaza generate_pdf_report(); es una variante para reportes simples.
+    """
+    _ensure_dir(output_pdf_path)
+    meta = metadata or {}
+
+    with PdfPages(output_pdf_path) as pdf:
+        # Portada (A4 aprox.)
+        fig = plt.figure(figsize=(8.27, 11.69))
+        fig.suptitle(title, fontsize=18, y=0.95)
+        lines = [f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+        for k in ["simbolo", "timeframe", "pasos_test", "modo", "outdir"]:
+            if k in meta:
+                lines.append(f"{k}: {meta[k]}")
+        plt.text(0.05, 0.85, "\n".join(lines), fontsize=11, va="top")
+        plt.axis("off")
+        pdf.savefig(fig); plt.close(fig)
+
+        # Páginas con imágenes
+        for p in image_paths or []:
+            if not os.path.isfile(p):
+                continue
+            img = plt.imread(p)
+            fig = plt.figure(figsize=(8.27, 11.69))
+            ax = fig.add_axes([0.05, 0.05, 0.90, 0.90])
+            ax.imshow(img)
+            ax.set_title(os.path.basename(p), fontsize=12)
+            ax.axis("off")
+            pdf.savefig(fig); plt.close(fig)
