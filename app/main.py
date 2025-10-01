@@ -1,5 +1,5 @@
 # ==========================================
-# app/main.py  (versión integrada MT5 + modelos · FIX steps)
+# app/main.py  (versión integrada MT5 + modelos + modo simple con Prophet)
 # ==========================================
 import os, sys, argparse, yaml
 import numpy as np
@@ -14,7 +14,6 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from scipy import stats
 import statsmodels.api as sm
 from sklearn.preprocessing import StandardScaler
-from reportes.reportes_excel import export_resultados_modelos
 
 # TensorFlow (opcional para LSTM)
 _TF_OK = True
@@ -30,7 +29,7 @@ from arch import arch_model
 # ----- Tu conexión MT5 -----
 from conexion.easy_Trading import Basic_funcs
 
-# (Opcional) mantén Prophet si existe en tu repo
+# (Opcional) mantener Prophet si existe en tu repo
 try:
     from modelos.prophet_model import entrenar_modelo_prophet, predecir_precio
     _PROPHET_OK = True
@@ -55,26 +54,33 @@ def mae(y_true, y_pred):
 
 def mape(y_true, y_pred):
     y_true = np.asarray(y_true); y_pred = np.asarray(y_pred)
-    return float(np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + 1e-8))) * 100)
+    denom = np.where(np.abs(y_true) < 1e-12, 1e-12, np.abs(y_true))
+    return float(np.mean(np.abs((y_true - y_pred) / denom)) * 100)
 
 def theils_u(y_true: pd.Series, y_pred: pd.Series) -> float:
-    e = y_pred.values - y_true.values
-    dy = np.diff(y_true.values, prepend=y_true.values[0])
+    e = pd.Series(y_pred).reindex_like(y_true).values - pd.Series(y_true).values
+    dy = np.diff(pd.Series(y_true).values, prepend=pd.Series(y_true).values[0])
     denom = np.sum(dy[1:]**2)
     return float(np.sqrt(np.sum(e[1:]**2) / (denom + 1e-12)))
 
 def hit_rate(y_true: pd.Series, y_pred: pd.Series) -> float:
-    dy_t = y_true.diff().dropna()
-    dy_p = y_pred.diff().reindex(dy_t.index).dropna()
+    dy_t = pd.Series(y_true).diff().dropna()
+    dy_p = pd.Series(y_pred).reindex_like(pd.Series(y_true)).diff().dropna()
+    dy_p = dy_p.reindex(dy_t.index)
     return float((np.sign(dy_t) == np.sign(dy_p)).mean())
 
 def diebold_mariano(y_true: pd.Series, y1: pd.Series, y2: pd.Series, h: int = 1, loss: str = "mse") -> dict:
-    y_true = y_true.astype(float); y1 = y1.reindex_like(y_true).astype(float); y2 = y2.reindex_like(y_true).astype(float)
+    y_true = pd.Series(y_true).astype(float)
+    y1 = pd.Series(y1).reindex_like(y_true).astype(float)
+    y2 = pd.Series(y2).reindex_like(y_true).astype(float)
     if loss=="mse":
         d = (y_true - y1)**2 - (y_true - y2)**2
     else:
-        d = np.abs(y_true - y1) - np.abs(y_true - y2)
-    d = d.dropna(); T = len(d); dbar = d.mean()
+        d = (y_true - y1).abs() - (y_true - y2).abs()
+    d = d.dropna(); T = len(d)
+    if T < 10:
+        return {"DM": float("nan"), "p_value": float("nan"), "T": int(T)}
+    dbar = d.mean()
     def acov(x,k): return np.cov(x[k:], x[:-k], bias=True)[0,1] if k>0 else np.var(x, ddof=0)
     s = acov(d.values,0)
     for k in range(1,h): s += 2*(1-k/h)*acov(d.values,k)
@@ -114,14 +120,20 @@ def fit_arima_series(price: pd.Series, order=(1,1,1)):
     m = ARIMA(price.astype(float), order=order, enforce_stationarity=False, enforce_invertibility=False)
     return m.fit()
 
-# ---- NUEVO: pronóstico por "steps" (no por fechas) ----
+def arima_predict_range(fit, start, end) -> pd.Series:
+    p = fit.get_prediction(start=start, end=end).predicted_mean
+    p.name = "arima"; return p
+
 def arima_forecast_steps(fit, steps: int, index) -> pd.Series:
     fc = fit.get_forecast(steps=steps).predicted_mean
-    return pd.Series(np.asarray(fc), index=index, name="arima")
+    return pd.Series(fc.values, index=index, name="arima")
 
 def fit_ets_series(price: pd.Series, trend="add", seasonal=None, seasonal_periods=None):
     m = ExponentialSmoothing(price.astype(float), trend=trend, seasonal=seasonal, seasonal_periods=seasonal_periods)
     return m.fit(optimized=True)
+
+def ets_predict_range(fit, start, end) -> pd.Series:
+    p = fit.predict(start=start, end=end); p.name = "ets"; return p
 
 def ets_forecast_steps(fit, steps: int, index) -> pd.Series:
     fc = fit.forecast(steps)
@@ -167,31 +179,6 @@ def garch_sigma_series(res, index: pd.DatetimeIndex, horizon: int = 1) -> pd.Ser
     f = res.forecast(horizon=horizon, reindex=True)
     sigma2 = f.variance.iloc[:, -1] / (100**2)
     return sigma2.pow(0.5).rename("garch_sigma").reindex(index)
-
-def garch_oos_sigma(ret: pd.Series, test_idx: pd.DatetimeIndex) -> pd.Series:
-    """
-    Pronóstico OOS de sigma_t con GARCH(1,1) rolling:
-    para cada t en test_idx, ajusta con retornos hasta t-1 y predice h=1.
-    Devuelve sigma en unidades de retorno (NO %), alineada con test_idx.
-    """
-    sigmas = []
-    for t in test_idx:
-        sub = ret.loc[:t].iloc[:-1].dropna()
-        # seguridad: mínimo de datos para GARCH
-        if len(sub) < 200:
-            sigmas.append(np.nan)
-            continue
-        try:
-            res = fit_garch(sub)  # usa tu fit_garch existente
-            f = res.forecast(horizon=1, reindex=False)
-            # 'f.variance' suele ser array-like -> última fila, col 0 (h=1)
-            sigma2_pct2 = float(np.asarray(f.variance)[-1, 0])     # en %^2
-            sigma2 = sigma2_pct2 / (100.0**2)                      # a unidades
-            sigmas.append(np.sqrt(sigma2))
-        except Exception:
-            sigmas.append(np.nan)
-    return pd.Series(sigmas, index=test_idx, name="garch_sigma")
-
 
 def fit_har_model(logrv_df: pd.DataFrame, use_iv: bool = False):
     X = np.log(logrv_df[["rv_d","rv_w","rv_m"]])
@@ -271,44 +258,26 @@ def backtest_vol_generic(df_ohlc: pd.DataFrame, iv: pd.Series | None, test_size_
     split_idx = -test_size_points
     rv_test_idx = rv.iloc[split_idx:].index
 
-    gsig = garch_oos_sigma(ret, rv_test_idx)
-    # Convertir sigma -> varianza para comparar con RV
-    garch_rv = gsig.pow(2).rename("garch_rv")
-
+    gfit = fit_garch(ret.loc[:rv_test_idx[0]].iloc[:-1])
+    gsig = garch_sigma_series(gfit, rv_test_idx)
 
     Xy = har_lags(rv)
     Xy = add_iv(Xy, iv.reindex(Xy.index) if iv is not None else None)
     use_iv = "log_iv" in Xy.columns
     hfit = fit_har_model(Xy.loc[:rv_test_idx[0]].iloc[:-1], use_iv=use_iv)
-    
+
     har_pred = []
-    valid_idx = Xy.index.intersection(rv_test_idx)
-    for t in valid_idx:
+    for t in Xy.index[Xy.index.isin(rv_test_idx)]:
         last = Xy.loc[:t].iloc[-1]
         har_pred.append((t, har_predict_one(hfit, last)))
     har_pred = pd.Series(dict(har_pred), name="har_rv").reindex(rv_test_idx)
 
     eval_df = pd.concat([rv.reindex(rv_test_idx).rename("rv_true"),
-                        garch_rv,                      # ahora en varianza
-                        har_pred.rename("har_rv")], axis=1)
-
-    # Limpieza/fallback mínimo: si todas NaN, intenta forward-fill de 1 paso
-    if eval_df.isna().all(axis=1).all():
-        eval_df["garch_sigma"] = eval_df["garch_sigma"].ffill()
-        eval_df["har_rv"] = eval_df["har_rv"].ffill()
-
-    eval_df = eval_df.dropna()
-    if eval_df.empty:
-        # como último recurso, salimos con métricas vacías pero sin crashear
-        os.makedirs(outdir, exist_ok=True)
-        eval_df.to_csv(os.path.join(outdir, "predicciones_vol.csv"))
-        metr = pd.DataFrame([{"model":"garch_sigma","RMSE":np.nan,"MAE":np.nan},
-                             {"model":"har_rv","RMSE":np.nan,"MAE":np.nan}]).set_index("model")
-        metr.to_csv(os.path.join(outdir, "metricas_vol.csv"))
-        return {"preds": eval_df, "metrics": metr, "har_summary": hfit.summary().as_text()}
+                         gsig.rename("garch_sigma"),
+                         har_pred.rename("har_rv")], axis=1).dropna()
 
     rows = []
-    for col in ["garch_rv","har_rv"]:
+    for col in ["garch_sigma","har_rv"]:
         rows.append({"model": col, "RMSE": rmse(eval_df["rv_true"], eval_df[col]),
                                "MAE": mae(eval_df["rv_true"], eval_df[col])})
     metr = pd.DataFrame(rows).set_index("model").sort_values("RMSE")
@@ -319,11 +288,6 @@ def backtest_vol_generic(df_ohlc: pd.DataFrame, iv: pd.Series | None, test_size_
     return {"preds": eval_df, "metrics": metr, "har_summary": hfit.summary().as_text()}
 
 # ==================== SELECCIÓN + SEÑAL ====================
-def series_to_prophet_df(price: pd.Series) -> pd.DataFrame:
-    dfp = price.reset_index()
-    dfp.columns = ["ds", "y"]
-    return dfp
-
 def train_and_forecast_all(price: pd.Series, window_lstm: int = 22, include_prophet: bool = False):
     last_idx = price.index[-1]
     preds = {}
@@ -331,12 +295,9 @@ def train_and_forecast_all(price: pd.Series, window_lstm: int = 22, include_prop
     # RW
     preds["rw"] = pd.Series(price.iloc[-1], index=[last_idx], name="rw")
 
-    # ARIMA / ETS (por steps=1 sobre todo el histórico)
-    ar_fit = fit_arima_series(price, order=(1,1,1))
-    preds["arima"] = arima_forecast_steps(ar_fit, steps=1, index=[last_idx])
-
-    ets_fit = fit_ets_series(price, trend="add", seasonal=None)
-    preds["ets"] = ets_forecast_steps(ets_fit, steps=1, index=[last_idx])
+    # ARIMA / ETS
+    preds["arima"] = arima_predict_range(fit_arima_series(price), start=last_idx, end=last_idx)
+    preds["ets"]   = ets_predict_range(fit_ets_series(price, trend="add", seasonal=None), start=last_idx, end=last_idx)
 
     # LSTM
     if _TF_OK:
@@ -349,12 +310,12 @@ def train_and_forecast_all(price: pd.Series, window_lstm: int = 22, include_prop
     # Prophet (opcional)
     if include_prophet and _PROPHET_OK:
         try:
-            dfp = series_to_prophet_df(price)
+            dfp = price.reset_index().rename(columns={price.index.name or "index":"ds", price.name or "Close":"y"})
             m = entrenar_modelo_prophet(dfp)
-            fc = predecir_precio(m, pasos=1, frecuencia="1min")
+            fc = predecir_precio(m, pasos=1, frecuencia="1min")  # paso único
             preds["prophet"] = pd.Series(float(fc["yhat"].iloc[0]), index=[last_idx], name="prophet")
         except Exception as e:
-            print(f"⚠️ Prophet no disponible en live ({e}).")
+            print(f"⚠️ Prophet no disponible en train_and_forecast_all ({e}).")
 
     return preds
 
@@ -365,13 +326,9 @@ def evaluate_recent_window(price: pd.Series, window_valid: int = 300, window_lst
     idx   = test.index
 
     preds = {}
-    preds["rw"] = predict_random_walk(price).reindex(idx)
-
-    ar_fit = fit_arima_series(train, order=(1,1,1))
-    preds["arima"] = arima_forecast_steps(ar_fit, steps=len(idx), index=idx)
-
-    ets_fit = fit_ets_series(train, trend="add", seasonal=None)
-    preds["ets"] = ets_forecast_steps(ets_fit, steps=len(idx), index=idx)
+    preds["rw"]    = predict_random_walk(price).reindex(idx)
+    preds["arima"] = arima_predict_range(fit_arima_series(train), start=idx[0], end=idx[-1]).reindex(idx)
+    preds["ets"]   = ets_predict_range(fit_ets_series(train, trend="add", seasonal=None), start=idx[0], end=idx[-1]).reindex(idx)
 
     if _TF_OK:
         try:
@@ -382,9 +339,10 @@ def evaluate_recent_window(price: pd.Series, window_valid: int = 300, window_lst
 
     if include_prophet and _PROPHET_OK:
         try:
-            dfp = series_to_prophet_df(train)
+            dfp = train.reset_index().rename(columns={train.index.name or "index":"ds", train.name or "y":"y"})
             m = entrenar_modelo_prophet(dfp)
-            fc = predecir_precio(m, pasos=len(idx), frecuencia="1min")
+            # frecuencia aproximada para el tramo
+            fc = predecir_precio(m, pasos=len(idx), frecuencia="D")
             preds["prophet"] = pd.Series(fc["yhat"].values, index=idx, name="prophet")
         except Exception as e:
             print(f"⚠️ Prophet no disponible en validación ({e}).")
@@ -419,24 +377,17 @@ def plot_rolling_error(df: pd.DataFrame, model: str, out_path: str, kind: str = 
     plt.title(f"Evolución del error ({kind}) · {model.upper()}"); plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path); plt.close()
-    
-def plot_vol_preds(vol_df: pd.DataFrame, out_path: str):
-    """
-    vol_df con columnas: rv_true, har_rv, garch_rv (o garch_sigma^2 ya convertido).
-    Dibuja en la misma escala (varianza).
-    """
-    plt.figure(figsize=(10,5))
-    base = vol_df.dropna(subset=["rv_true"])
-    plt.plot(base.index, base["rv_true"], label="RV (realizada)")
-    if "har_rv" in base.columns:
-        plt.plot(base.index, base["har_rv"], label="HAR-RV")
-    if "garch_rv" in base.columns:
-        plt.plot(base.index, base["garch_rv"], label="GARCH (var)")
-    plt.title("Volatilidad realizada vs pronósticos (varianza)")
-    plt.legend(); plt.tight_layout()
+
+def plot_vol_preds(df: pd.DataFrame, out_path: str):
+    plt.figure(figsize=(10,4))
+    if "rv_true" in df.columns: plt.plot(df.index, df["rv_true"], label="RV Real", linewidth=2)
+    for c in [c for c in df.columns if c!="rv_true"]:
+        plt.plot(df.index, df[c], label=c)
+    plt.title("Volatilidad realizada vs pronósticos"); plt.legend(); plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path); plt.close()
-    
+
+# --- Gráficos simples (para modo simple) ---
 def plot_level_preds_simple(df: pd.DataFrame, out_path: str, title: str = "Precio real vs predicciones"):
     plt.figure(figsize=(10,5))
     plt.plot(df.index, df["y"], label="Real", linewidth=2)
@@ -455,8 +406,6 @@ def plot_trend_simple(price: pd.Series, out_path: str, windows=(20,60)):
     plt.legend(); plt.tight_layout()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path); plt.close()
-
-
 
 # ==================== HELPERS MT5 ====================
 def obtener_df_desde_mt5(bf: Basic_funcs, symbol: str, timeframe: str, n_barras: int) -> pd.DataFrame:
@@ -504,12 +453,12 @@ def main():
             raise RuntimeError("No se obtuvieron datos desde MT5.")
         price = df["Close"].astype(float)
 
-        # 🔧 Normaliza índice: datetime, único, ordenado
+        # Normaliza índice: datetime, único, ordenado
         price.index = pd.to_datetime(price.index, errors="coerce")
         price = price[~price.index.duplicated()].sort_index()
         price = price[price.index.notna()]
 
-        # ---------- MODO: MODELOS (backtests) ----------
+        # ---------- MODO: MODELOS (backtests completos) ----------
         if args.modo == "modelos":
             test_pts = max(500, int(0.25 * len(price)))
             res_nivel = backtest_nivel_generic(price, test_size_points=test_pts, window_lstm=22, outdir=outdir)
@@ -517,80 +466,61 @@ def main():
             for m in [c for c in res_nivel.preds.columns if c!="y"]:
                 plot_rolling_error(res_nivel.preds, m, os.path.join(outdir, f"errores_{m}.png"))
             res_vol = backtest_vol_generic(df[["High","Low","Close"]], iv=None, test_size_points=test_pts, outdir=outdir)
+            plot_vol_preds(res_vol["preds"], os.path.join(outdir, "vol_pred_vs_real.png"))
 
             print("\n== MÉTRICAS NIVEL =="); print(res_nivel.metrics.round(6))
             print("\n== DM vs RW =="); [print(k, v) for k, v in res_nivel.dm.items()]
             print("\n== MÉTRICAS VOL =="); print(res_vol["metrics"].round(6))
             print("\n== HAR SUMMARY =="); print(res_vol["har_summary"])
-            ruta_xlsx = config.get("ruta_reporte", os.path.join("outputs", "reporte_inversion.xlsx"))
 
-            # Asegúrate de que en res_vol["preds"] la columna de GARCH esté en varianza
-            # (si tu backtest ya la llama garch_rv, esto no toca nada; si viene en sigma, convertimos aquí):
-            res_vol_preds = res_vol["preds"].copy()
-            if "garch_rv" not in res_vol_preds.columns and "garch_sigma" in res_vol_preds.columns:
-                res_vol_preds["garch_rv"] = res_vol_preds["garch_sigma"] ** 2
-
-            cfg_export = {
-                "simbolo": simbolo,
-                "timeframe": timeframe,
-                "cantidad_datos": cantidad,
-                "modo": "modelos",
-                "outdir": outdir
-            }
-
-            export_resultados_modelos(
-                ruta_excel=ruta_xlsx,
-                res_nivel_metrics=res_nivel.metrics,   # DataFrame
-                res_nivel_preds=res_nivel.preds,       # DataFrame
-                res_nivel_dm=res_nivel.dm,             # dict
-                res_vol_metrics=res_vol["metrics"],    # DataFrame
-                res_vol_preds=res_vol_preds,           # DataFrame
-                har_summary_text=res_vol["har_summary"], # str
-                cfg_dict=cfg_export
-            )
-
-            print(f"💾 Reporte exportado a: {ruta_xlsx}")
-            
-            # ===== Generar y empaquetar imágenes en PDF =====
-            from reportes.reportes_pdf import generate_pdf_report
-
-            # 1) Asegura gráfico de volatilidad
-            vol_img = os.path.join(outdir, "vol_pred_vs_real.png")
-            plot_vol_preds(res_vol_preds, vol_img)
-
-            # 2) Reunir imágenes ya generadas + la de vol
-            image_paths = [os.path.join(outdir, "nivel_pred_vs_real.png")]
-            for m in [c for c in res_nivel.preds.columns if c != "y"]:
-                image_paths.append(os.path.join(outdir, f"errores_{m}.png"))
-            image_paths.append(vol_img)
-
-            # 3) Ruta PDF (si no está en YAML, derivarlo del xlsx)
-            ruta_pdf = config.get("ruta_pdf", ruta_xlsx.replace(".xlsx", ".pdf"))
-            generate_pdf_report(
-                output_pdf_path=ruta_pdf,
-                image_paths=image_paths,
-                title="Informe de Resultados — Modo Modelos",
-                metadata=cfg_export
-            )
-            print(f"📄 PDF exportado: {ruta_pdf}")
+            # Reportes completos (si los usas en este modo)
+            try:
+                from reportes.reportes_excel import export_resultados_modelos
+                ruta_xlsx = config.get("ruta_reporte", os.path.join("outputs","reporte_inversion.xlsx"))
+                export_resultados_modelos(
+                    ruta_excel=ruta_xlsx,
+                    res_nivel_metrics=res_nivel.metrics,
+                    res_nivel_preds=res_nivel.preds,
+                    res_nivel_dm=res_nivel.dm,
+                    res_vol_metrics=res_vol["metrics"],
+                    res_vol_preds=res_vol["preds"],
+                    har_summary_text=res_vol["har_summary"],
+                    cfg_dict={"simbolo": simbolo, "timeframe": timeframe, "modo": "modelos", "outdir": outdir}
+                )
+                from reportes.reportes_pdf import generate_pdf_report
+                pdf_imgs = [
+                    os.path.join(outdir, "nivel_pred_vs_real.png"),
+                    *[os.path.join(outdir, f"errores_{m}.png") for m in [c for c in res_nivel.preds.columns if c!="y"]],
+                    os.path.join(outdir, "vol_pred_vs_real.png"),
+                ]
+                ruta_pdf = config.get("ruta_pdf", os.path.join("outputs","reporte_inversion.pdf"))
+                generate_pdf_report(
+                    output_pdf_path=ruta_pdf,
+                    image_paths=pdf_imgs,
+                    title="Informe de Resultados (Modo Modelos)",
+                    metadata={"simbolo": simbolo, "timeframe": timeframe, "cantidad_datos": cantidad, "modo":"modelos", "outdir": outdir}
+                )
+            except Exception as e:
+                print(f"⚠️ Reportes completos no generados ({e}).")
             return
 
-        # ---------- MODO: EDA (si existe tu módulo) ----------
+        # ---------- MODO: EDA ----------
         if args.modo == "eda":
             if not _EDA_OK:
                 print("⚠️ ejecutar_eda no disponible en procesamiento/eda_crispdm.py")
             else:
                 ejecutar_eda(df_eurusd=df, df_spy=None, cfg=config)
             return
-        
-        # ---------- MODO: SIMPLE (backtest 1 split, métricas y gráficos básicos) ----------
+
+        # ---------- MODO: SIMPLE (backtest 1 split + Excel/PDF simples, CON Prophet) ----------
         if args.modo == "simple":
-            # Parámetros: usa YAML o valores sensatos
+            from reportes.reportes_excel import export_excel_simple
+            from reportes.reportes_pdf import generate_pdf_simple
+
             pasos_test = int(config.get("pasos_test", max(200, int(0.25*len(price)))))
             outdir_simple = os.path.join(eda_cfg.get("outdir","outputs/eda"), simbolo, "simple")
             os.makedirs(outdir_simple, exist_ok=True)
 
-            # Split
             assert pasos_test < len(price), "pasos_test debe ser menor que el total"
             train = price.iloc[:-pasos_test]
             test  = price.iloc[-pasos_test:]
@@ -599,15 +529,14 @@ def main():
             # Baseline
             rw = predict_random_walk(price, horizon=1).reindex(test_idx)
 
-            # ARIMA (usa tu fit_arima_series actual)
+            # ARIMA / ETS
             ar_fit = fit_arima_series(train, order=(1,1,1))
             ar_pred = arima_forecast_steps(ar_fit, steps=len(test_idx), index=test_idx)
 
-            # ETS sencillo
             ets_fit = fit_ets_series(train, trend="add", seasonal=None)
             ets_pred = ets_forecast_steps(ets_fit, steps=len(test_idx), index=test_idx)
 
-            # LSTM (si está disponible)
+            # LSTM (opcional)
             lstm_pred = None
             if _TF_OK:
                 try:
@@ -615,56 +544,42 @@ def main():
                     lstm_pred = lstm_predict_price(lstm_state, price).reindex(test_idx)
                 except Exception as e:
                     print(f"⚠️ LSTM omitido (simple) ({e}).")
-                    
-                        # Prophet (opcional) — simple y alineado al resto
+
+            # Prophet (AQUÍ VA LA INTEGRACIÓN NUEVA)
             prophet_pred = None
             if _PROPHET_OK:
                 try:
-                    # Prophet requiere dataframe con columnas ds (fecha) e y (valor)
                     dfp = train.reset_index()
                     dfp.columns = ["ds", "y"]  # asegurar nombres
+                    tfu = str(timeframe).upper()
+                    freq = "D" if tfu in ("D1","D") else "5min"
                     mprop = entrenar_modelo_prophet(dfp)
-                    # Pronostica exactamente el largo del test, frecuencia diaria 'D' en D1
-                    # (Si tu timeframe es M5, usa '5min'; aquí, en D1, 'D' es lo natural)
-                    freq = "D" if timeframe.upper()=="D1" else "5min"
                     fc = predecir_precio(mprop, pasos=len(test_idx), frecuencia=freq)
                     prophet_pred = pd.Series(fc["yhat"].values, index=test_idx, name="prophet")
+                    print(f"ℹ️ Prophet incluido en modo simple (freq={freq}, pasos={len(test_idx)})")
                 except Exception as e:
-                    print(f"⚠️ Prophet omitido (simple) ({e}).")
-
+                    print(f"⚠️ Prophet omitido (simple): {e}")
+            else:
+                print("ℹ️ Prophet no disponible (_PROPHET_OK=False)")
 
             # Consolidar
             cols = {"y": test, "rw": rw, "arima": ar_pred, "ets": ets_pred}
-            if prophet_pred is not None:cols["prophet"] = prophet_pred
-            if lstm_pred is not None: cols["lstm"] = lstm_pred
+            if prophet_pred is not None:
+                cols["prophet"] = prophet_pred
+            if lstm_pred is not None:
+                cols["lstm"] = lstm_pred
             df_simple = pd.DataFrame(cols).dropna()
 
             # Métricas simples
-            def _rmse(a,b): return float(np.sqrt(np.mean((np.asarray(a)-np.asarray(b))**2)))
-            def _mae(a,b):  return float(np.mean(np.abs(np.asarray(a)-np.asarray(b))))
-            def _mape(a,b):
-                a = np.asarray(a); b = np.asarray(b)
-                denom = np.where(np.abs(a)<1e-12, 1e-12, np.abs(a))
-                return float(np.mean(np.abs((a-b)/denom))*100)
-            def _theils(y, p):
-                y = pd.Series(y); p = pd.Series(p).reindex_like(y)
-                e = (p - y).values
-                dy = np.diff(y.values, prepend=y.values[0])
-                denom = np.sum(dy[1:]**2)
-                return float(np.sqrt(np.sum(e[1:]**2)/(denom+1e-12)))
-            def _hit(y,p):
-                y = pd.Series(y); p = pd.Series(p).reindex_like(y)
-                return float((np.sign(y.diff().dropna())==np.sign(p.diff().reindex(y.index).dropna())).mean())
-
             rows = []
             for m in [c for c in df_simple.columns if c!="y"]:
                 rows.append({
                     "model": m,
-                    "RMSE": _rmse(df_simple["y"], df_simple[m]),
-                    "MAE": _mae(df_simple["y"], df_simple[m]),
-                    "MAPE(%)": _mape(df_simple["y"], df_simple[m]),
-                    "TheilsU": _theils(df_simple["y"], df_simple[m]),
-                    "HitRate": _hit(df_simple["y"], df_simple[m]),
+                    "RMSE": rmse(df_simple["y"], df_simple[m]),
+                    "MAE": mae(df_simple["y"], df_simple[m]),
+                    "MAPE(%)": mape(df_simple["y"], df_simple[m]),
+                    "TheilsU": theils_u(df_simple["y"], df_simple[m]),
+                    "HitRate": hit_rate(df_simple["y"], df_simple[m]),
                 })
             metr_simple = pd.DataFrame(rows).set_index("model").sort_values(["RMSE","TheilsU"])
 
@@ -684,9 +599,7 @@ def main():
             df_simple.to_csv(os.path.join(outdir_simple, "predicciones_simple.csv"))
             metr_simple.to_csv(os.path.join(outdir_simple, "metricas_simple.csv"))
 
-            # Reportes: Excel/PDF simples (se suman al “completo”, no lo sustituyen)
-            from reportes.reportes_excel import export_excel_simple
-            from reportes.reportes_pdf import generate_pdf_simple
+            # Reportes: Excel/PDF simples
             ruta_xlsx = config.get("ruta_reporte", os.path.join("outputs","reporte_inversion.xlsx")).replace(".xlsx","_simple.xlsx")
             export_excel_simple(
                 ruta_excel=ruta_xlsx,
@@ -707,13 +620,12 @@ def main():
             print(f"📄 PDF simple: {ruta_pdf}")
             return
 
-
         # ---------- MODO: NORMAL (trading) ----------
         if modelo_str == "prophet":
             if not _PROPHET_OK:
                 raise RuntimeError("Prophet no disponible en el entorno.")
             print("🤖 Entrenando modelo Prophet…")
-            dfp = series_to_prophet_df(price)
+            dfp = price.reset_index().rename(columns={price.index.name or "index":"ds", price.name or "Close":"y"})
             m = entrenar_modelo_prophet(dfp)
             fc = predecir_precio(m, pasos=pasos_pred, frecuencia=frecuencia_pred)
             price_now = float(price.iloc[-1])
@@ -736,7 +648,7 @@ def main():
             metr.to_csv(os.path.join(outdir, "metricas_comparativo_nivel.csv"))
 
         else:
-            raise ValueError(f"Modelo '{modelo_str}' no implementado. Usa 'prophet' o 'auto'.")
+            raise ValueError(f"Modelo '{modelo_str}' no implementado. Usa 'prophet', 'auto' o 'simple'.")
 
         # ----- Enganche con tu Agente de Análisis (si existe) -----
         try:
@@ -753,6 +665,7 @@ def main():
         except Exception:
             pass
         print("🛑 Conexión cerrada")
-        
+
+
 if __name__ == "__main__":
     main()

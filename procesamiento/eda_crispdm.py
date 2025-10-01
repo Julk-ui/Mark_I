@@ -304,7 +304,7 @@ def _add_table_page(pdf: PdfPages, df: pd.DataFrame, title: str, index: bool = F
         df_show = df_show.reset_index(drop=True)
     if len(df_show) > max_rows:
         df_show = df_show.head(max_rows)
-    df_show = df_show.applymap(lambda x: round(x, 6) if isinstance(x, (float, np.floating)) else x)
+    df_show = df_show.apply(lambda c: c.round(6) if (hasattr(c, "dtype") and (c.dtype.kind in "fc")) else c)
 
     fig, ax = plt.subplots(figsize=(11, 7))
     ax.axis("off")
