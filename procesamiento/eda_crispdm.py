@@ -1,7 +1,9 @@
-# procesamiento/eda_crispdm.py — EDA claro (CRISP-DM) con ARIMA/SARIMA, narrativa y exportación PDF/Excel
-# Reemplaza tu archivo por este completo si ves errores de indentación o variables no definidas.
+# procesamiento/eda_crispdm.py — EDA completo (CRISP-DM) con informe ejecutivo y comparación ARIMA/SARIMA
+from __future__ import annotations
 import os
 import warnings
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,7 +15,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels")
 
-# ---------- ARIMA / SARIMA opcionales ----------
+# ---------- Scanners de modelos (opcionales) ----------
 try:
     from modelos.arima_scan import escanear_arima
     _ARIMA_SCAN_OK = True
@@ -28,16 +30,52 @@ except Exception as _e:
     _SARIMA_SCAN_OK = False
     print(f"ℹ️ SARIMA scan no disponible ({_e}).")
 
+# ---------- Módulos auxiliares del EDA (opcionales) ----------
+try:
+    from procesamiento.data_quality import data_quality_report
+    _DQ_OK = True
+except Exception as _e:
+    _DQ_OK = False
+    print(f"ℹ️ Módulo data_quality no disponible ({_e}).")
+
+try:
+    from procesamiento.stationarity import stationarity_tests
+    _STAT_OK = True
+except Exception as _e:
+    _STAT_OK = False
+    print(f"ℹ️ Módulo stationarity no disponible ({_e}).")
+
+try:
+    from procesamiento.diagnostics import (
+        bic_heatmap_arima, bic_heatmap_sarima,
+        residual_diagnostics, garch_vol_plot
+    )
+    _DIAG_OK = True
+except Exception as _e:
+    _DIAG_OK = False
+    print(f"ℹ️ Módulo diagnostics no disponible ({_e}).")
+
+# import robusto para CCF
+try:
+    from procesamiento.ccf import plot_ccf
+    _CCF_OK = True
+except Exception:
+    try:
+        from .ccf import plot_ccf
+        _CCF_OK = True
+    except Exception as _e:
+        _CCF_OK = False
+        print(f"ℹ️ Módulo ccf no disponible ({_e}).")
+
 
 # =======================
-# Utilidades básicas
+# Utilidades
 # =======================
 def _safe_mkdir(p: str) -> None:
     if p and not os.path.exists(p):
         os.makedirs(p, exist_ok=True)
 
 def _ensure_dt_index(df: pd.DataFrame, col_candidates=("timestamp","date","datetime","Date","Datetime")) -> pd.DataFrame:
-    """Asegura índice datetime (UTC) a partir de una columna probable; o valida si ya es DatetimeIndex."""
     d = df.copy()
     if isinstance(d.index, pd.DatetimeIndex):
         return d.sort_index()
@@ -55,7 +93,6 @@ def _find_close(df: pd.DataFrame) -> str:
     raise ValueError("No se encontró columna de precio/cierre.")
 
 def _resample_ohlc(df: pd.DataFrame, freq: str, price_col: str) -> pd.DataFrame:
-    """Resamplea a la frecuencia deseada, preservando OHLC si existen; si no, último cierre y suma de volumen."""
     cols_lower = [c.lower() for c in df.columns]
     has_ohlc = all(x in cols_lower for x in ["open","high","low",price_col.lower()])
     if has_ohlc:
@@ -81,8 +118,8 @@ def _resample_ohlc(df: pd.DataFrame, freq: str, price_col: str) -> pd.DataFrame:
 
 def _stl_period_by_freq(freq: str) -> int:
     f = str(freq).upper()
-    if f in ("D","1D"): return 7
-    if f in ("H","1H"): return 24
+    if f in ("D","1D"): return 7         # semanal
+    if f in ("H","1H"): return 24        # diario
     if f.endswith("T"):
         try:
             minutes = int(f[:-1])
@@ -99,9 +136,9 @@ def _to_naive_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =======================
-# Cálculos
+# Cálculos base
 # =======================
-def _compute_returns_blocks(df: pd.DataFrame, price_col: str):
+def _compute_returns_blocks(df: pd.DataFrame, price_col: str) -> Tuple[pd.Series, pd.Series]:
     r = df[price_col].pct_change()
     lr = np.log(df[price_col]).diff()
     return r, lr
@@ -128,7 +165,7 @@ def _compute_stats(logret: pd.Series) -> pd.DataFrame:
     }
     return pd.DataFrame([out])
 
-def _atr_if_available(df: pd.DataFrame) -> pd.Series | None:
+def _atr_if_available(df: pd.DataFrame) -> Optional[pd.Series]:
     cols = [c.lower() for c in df.columns]
     has = all(x in cols for x in ["high","low"])
     close_name = next((c for c in df.columns if c.lower() in ("close","price","adj close")), None)
@@ -149,7 +186,7 @@ def _signals_from_series(df: pd.DataFrame, price_col: str) -> pd.DataFrame:
     sma200 = s.rolling(200).mean()
     if len(sma200.dropna()):
         out["Tendencia_MA"] = "Alcista (SMA50>SMA200)" if float(sma50.iloc[-1]) > float(sma200.iloc[-1]) else "Bajista (SMA50<=SMA200)"
-    # RSI(14) (EMA)
+    # RSI(14)
     delta = s.diff()
     up = delta.clip(lower=0.0).ewm(alpha=1/14, adjust=False).mean()
     down = (-delta.clip(upper=0.0)).ewm(alpha=1/14, adjust=False).mean()
@@ -289,12 +326,12 @@ def _plot_rolling_corr(df_eur_lr, df_spy_lr, outdir, window=60, title_suffix="EU
 # Exportadores (Excel + PDF)
 # =======================
 def _export_excel(outpath: str, heads: dict, resumenes: dict, stats_map: dict,
-                  corr_df: pd.DataFrame|None, roll_corr: pd.DataFrame|None) -> None:
+                  corr_df: Optional[pd.DataFrame], roll_corr: Optional[pd.DataFrame]) -> None:
     # Motor preferido
     try:
         import xlsxwriter  # noqa
         writer_kwargs = {"engine": "xlsxwriter", "datetime_format": "yyyy-mm-dd hh:mm"}
-    except ImportError:
+    except Exception:
         writer_kwargs = {"engine": "openpyxl"}
 
     with pd.ExcelWriter(outpath, **writer_kwargs) as w:
@@ -322,7 +359,7 @@ def _export_excel(outpath: str, heads: dict, resumenes: dict, stats_map: dict,
                 rc.index = rc.index.tz_localize(None)
             rc.to_excel(w, sheet_name="Rolling_corr")
 
-def _add_image_page(pdf: PdfPages, img_path: str, title: str | None = None) -> None:
+def _add_image_page(pdf: PdfPages, img_path: str, title: Optional[str] = None) -> None:
     if not img_path or not os.path.exists(img_path):
         return
     img = plt.imread(img_path)
@@ -365,9 +402,10 @@ def _add_text_page(pdf: PdfPages, title: str, text: str) -> None:
     pdf.savefig(fig); plt.close(fig)
 
 def _export_pdf(outdir: str, artifacts_by_symbol: dict,
-                corr_df: pd.DataFrame | None,
-                roll_corr: pd.DataFrame | None,
-                narrative_map: dict | None = None,
+                corr_df: Optional[pd.DataFrame],
+                roll_corr: Optional[pd.DataFrame],
+                narrative_map: Optional[dict] = None,
+                exec_summary: Optional[str] = None,
                 filename: str = "EDA_informe.pdf") -> None:
     pdf_path = os.path.join(outdir, filename)
     with PdfPages(pdf_path) as pdf:
@@ -379,13 +417,15 @@ def _export_pdf(outdir: str, artifacts_by_symbol: dict,
         plt.text(0.5, 0.48, f"Carpeta: {outdir}", ha="center", va="center", fontsize=10)
         pdf.savefig(fig); plt.close(fig)
 
+        # Informe ejecutivo (global)
+        if exec_summary:
+            _add_text_page(pdf, "00 Informe ejecutivo", exec_summary)
+
         # Por activo
         for symbol, art in artifacts_by_symbol.items():
-            # 00 — Narrativa ejecutiva (si existe)
             if narrative_map and symbol in narrative_map:
                 _add_text_page(pdf, f"{symbol} — 00 Narrativa ejecutiva", narrative_map.get(symbol, ""))
 
-            # Tablas y gráficos
             _add_table_page(pdf, art.get("HEAD"),   f"{symbol} — HEAD (primeras filas)", index=True)
             _add_table_page(pdf, art.get("RESUMEN"),f"{symbol} — RESUMEN",               index=False)
             _add_table_page(pdf, art.get("STATS"),  f"{symbol} — STATS (log-returns)",   index=False)
@@ -399,8 +439,14 @@ def _export_pdf(outdir: str, artifacts_by_symbol: dict,
             _add_image_page(pdf, art.get("IMG_07"), f"{symbol} — 07 ACF log-returns")
             _add_image_page(pdf, art.get("IMG_08"), f"{symbol} — 08 PACF log-returns")
             _add_image_page(pdf, art.get("IMG_09"), f"{symbol} — 09 Curva de drawdown")
-            # Si tienes GARCH, se incluye si existe:
+            # Residuales y GARCH
+            _add_image_page(pdf, art.get("IMG_RES_ACF"),  f"{symbol} — ACF Residuales")
+            _add_image_page(pdf, art.get("IMG_RES_PACF"), f"{symbol} — PACF Residuales")
+            _add_image_page(pdf, art.get("IMG_RES_QQ"),   f"{symbol} — QQ Residuales")
             _add_image_page(pdf, art.get("IMG_10_GARCH"), f"{symbol} — 10 Volatilidad GARCH (σ anualizada)")
+            # Mapas BIC
+            for k in sorted([x for x in art.keys() if str(x).startswith("IMG_BIC_")]):
+                _add_image_page(pdf, art.get(k), f"{symbol} — {k}")
 
         # Correlación entre activos
         if corr_df is not None:
@@ -409,18 +455,24 @@ def _export_pdf(outdir: str, artifacts_by_symbol: dict,
             _add_table_page(pdf, roll_corr, "Correlación móvil (ventana)", index=True)
             _add_image_page(pdf, os.path.join(outdir, "EURUSD_SPY_10_rolling_corr.png"),
                             "Correlación móvil EURUSD vs SPY/US500 — gráfico")
+        # CCF si existe
+        ccf_path = os.path.join(outdir, "ccf.png")
+        if os.path.exists(ccf_path):
+            _add_image_page(pdf, ccf_path, "CCF EURUSD vs SPY (retornos)")
+
     print(f"📄 Informe PDF generado: {pdf_path}")
 
 
 # =======================
-# Narrativa ejecutiva
+# Narrativa + Informe Ejecutivo
 # =======================
 def _narrativa_basica(symbol: str, resumen_df: pd.DataFrame, stats_df: pd.DataFrame,
-                      best_model_txt: str | None = None,
-                      corr_mean: float | None = None, corr_last: float | None = None) -> str:
-    import re as _re
-    r = resumen_df.iloc[0].to_dict() if resumen_df is not None and not resumen_df.empty else {}
+                      best_model_txt: Optional[str] = None,
+                      best_row: Optional[pd.Series] = None,
+                      alt_model_txt: Optional[str] = None,
+                      alt_row: Optional[pd.Series] = None) -> str:
     s = stats_df.iloc[0].to_dict() if stats_df is not None and not stats_df.empty else {}
+    r = resumen_df.iloc[0].to_dict() if resumen_df is not None and not resumen_df.empty else {}
     jb_p = s.get("JB_pvalue", float("nan"))
     jb_text = "no normal" if (isinstance(jb_p, (int,float)) and jb_p < 0.05) else "compatible con normalidad"
     try:
@@ -428,64 +480,56 @@ def _narrativa_basica(symbol: str, resumen_df: pd.DataFrame, stats_df: pd.DataFr
     except Exception:
         mdd_pct = float("nan")
 
-    corr_txt = ""
-    if (corr_mean is not None) and (corr_last is not None):
-        corr_txt = f"\n• Correlación EURUSD–SPY: media {corr_mean:.2f}, actual {corr_last:.2f}."
-
-    model_lines = []
-    if isinstance(best_model_txt, str) and best_model_txt:
-        model_lines.append(f"• Modelo recomendado (por BIC): {best_model_txt}")
-        m_arima = _re.match(r"ARIMA\((\d+),(\d+),(\d+)\)", best_model_txt or "")
-        m_sarima = _re.match(r"SARIMA\((\d+),(\d+),(\d+)\)x\((\d+),(\d+),(\d+)\)\[(\d+)\]", best_model_txt or "")
-        if m_arima:
-            model_lines += [
-                "  - d: nº de diferencias sobre log-precio (quita tendencia).",
-                "  - p: memoria AR en retornos (lags de la serie diferenciada).",
-                "  - q: media móvil (impacto de shocks previos en el error).",
-                "  - Diagnóstico deseable: Ljung–Box p ≥ 0.05 en residuales (ruido blanco).",
-            ]
-        elif m_sarima:
-            model_lines += [
-                "  - Parte no estacional (p,d,q) y parte estacional (P,D,Q) con periodo s.",
-                "  - d/D: diferencias (no estacional / estacional) para estabilizar media.",
-                "  - p/P: memoria a lags cortos / a múltiplos de s.",
-                "  - q/Q: shocks a corto plazo / a múltiplos de s.",
-                "  - Diagnóstico deseable: Ljung–Box p ≥ 0.05 en residuales (ruido blanco).",
-            ]
-    else:
-        model_lines.append("• Modelos escaneados: ARIMA y SARIMA (se elige por BIC más bajo).")
-
     lines = [
         f"{symbol} (diario)",
         f"• Periodo: {r.get('inicio')} → {r.get('fin')}",
         f"• Precio medio: {r.get('precio_promedio', float('nan')):.4f} | Último: {r.get('precio_ultimo', float('nan'))} | Rango [{r.get('precio_min', float('nan'))}, {r.get('precio_max', float('nan'))}]",
         f"• Riesgo (log-returns): σ={s.get('std', float('nan')):.4f} (~{s.get('std', float('nan'))*100:.2f}%), VaR95={s.get('VaR_95', float('nan'))*100:.2f}%, ES95={s.get('ES_95', float('nan'))*100:.2f}%, JB p={jb_p:.2g} ⇒ {jb_text}.",
-        f"• MDD aprox.: {mdd_pct:.2%}."
-    ] + model_lines
+        f"• MDD aprox.: {mdd_pct:.2%}.",
+    ]
 
-    if corr_txt:
-        lines.append(corr_txt)
+    if best_model_txt:
+        bic = float(best_row["bic"]) if best_row is not None and "bic" in best_row else np.nan
+        aic = float(best_row["aic"]) if best_row is not None and "aic" in best_row else np.nan
+        lb = best_row.get("lb_p", np.nan) if best_row is not None else np.nan
+        lines += [
+            f"• Modelo recomendado (menor BIC): {best_model_txt}  | BIC={bic:.2f}, AIC={aic:.2f}, Ljung–Box p={lb if isinstance(lb,(int,float)) else lb}.",
+        ]
+        if alt_model_txt and alt_row is not None:
+            delta = float(alt_row["bic"]) - bic
+            lines += [f"  Alternativa: {alt_model_txt}  | BIC={float(alt_row['bic']):.2f} (ΔBIC={delta:+.2f})."]
+        lines += [
+            "  Diagnóstico esperado: residuales ≈ ruido blanco (Ljung–Box p≥0.05) y ACF/PACF de residuales sin picos significativos."
+        ]
+    else:
+        lines += ["• Modelos evaluados: ARIMA y SARIMA (recomendación por BIC + Ljung–Box)."]
 
     return "\n".join(lines) + "\n"
+
+
+def _build_exec_summary(best_map: Dict[str, dict], corr_df: Optional[pd.DataFrame], roll_corr: Optional[pd.DataFrame]) -> str:
+    parts = ["Objetivo: describir patrones, riesgos y estructura temporal de EURUSD y SPY para servir de base al modelado predictivo (horizonte 1D).",
+             "Criterio de modelos: comparación ARIMA vs SARIMA por BIC; verificación de residuales (Ljung–Box) y gráficos ACF/PACF de residuales."]
+    for sym, info in best_map.items():
+        if not info: 
+            continue
+        line = f"{sym}: {info.get('best_txt','(sin modelo)')} (BIC={info.get('best_bic'):.2f})"
+        if info.get("alt_txt"):
+            line += f" · Alt: {info.get('alt_txt')} (ΔBIC={info.get('alt_bic_delta'):+.2f})"
+        parts.append(line)
+    if roll_corr is not None and not roll_corr.empty:
+        parts.append(f"Correlación móvil: media={roll_corr['rolling_corr'].mean():.2f}, actual={roll_corr['rolling_corr'].iloc[-1]:.2f}.")
+    if corr_df is not None:
+        parts.append(f"Matriz de correlación (retornos):\n{corr_df.round(2).to_string()}")
+    return "\n".join(parts)
 
 
 # =======================
 # EDA (principal)
 # =======================
-def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
-                 df_spy: pd.DataFrame | None = None,
-                 cfg: dict | None = None) -> None:
-    """
-    EDA ampliado (CRISP-DM):
-      - HEAD / RESUMEN / STATS
-      - Precio y Tendencia (MA), Serie, STL
-      - Distribución/QQ de log-returns
-      - Volatilidad rolling y ATR
-      - ACF/PACF
-      - Drawdown
-      - Correlación (si hay 2 activos)
-      - Recomendación ARIMA/SARIMA (Top-1 por BIC) + narrativa ejecutiva (PDF/Excel)
-    """
+def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
+                 df_spy: Optional[pd.DataFrame] = None,
+                 cfg: Optional[dict] = None) -> None:
     eda_cfg = (cfg or {}).get("eda", {})
     freq = str(eda_cfg.get("frecuencia_resampleo", "D"))
     outdir = eda_cfg.get("outdir", "outputs/eda")
@@ -497,11 +541,26 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
     alias_spy = eda_cfg.get("alias_spy", "SPY")
     _safe_mkdir(outdir)
 
+    # Mapa para acceder al df original por símbolo (para diagnósticos posteriores)
+    original_df_map: Dict[str, pd.DataFrame] = {}
+    if df_eurusd is not None:
+        original_df_map[alias_eur] = df_eurusd.copy()
+    if df_spy is not None:
+        original_df_map[alias_spy] = df_spy.copy()
+
     activos = [(alias_eur, df_eurusd), (alias_spy, df_spy)]
-    heads, resumenes, stats_map = {}, {}, {}
-    artifacts: dict = {}
-    arima_map, sarima_map = {}, {}
-    narrative_map, signals_map = {}, {}
+    heads: Dict[str, pd.DataFrame] = {}
+    resumenes: Dict[str, pd.DataFrame] = {}
+    stats_map: Dict[str, pd.DataFrame] = {}
+    artifacts: Dict[str, dict] = {}
+    arima_map: Dict[str, Optional[pd.DataFrame]] = {}
+    sarima_map: Dict[str, Optional[pd.DataFrame]] = {}
+    narrative_map: Dict[str, str] = {}
+    signals_map: Dict[str, pd.DataFrame] = {}
+    dq_map: Dict[str, pd.DataFrame] = {}
+    stat_tests_map: Dict[str, pd.DataFrame] = {}
+    resid_diag_map: Dict[str, pd.DataFrame] = {}
+    compare_summary_map: Dict[str, dict] = {}
 
     # --- Por activo ---
     for symbol, df in activos:
@@ -516,11 +575,10 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
         ret, logret = _compute_returns_blocks(df, price_col)
         atr = _atr_if_available(df)
 
-        # HEAD
+        # HEAD y RESUMEN
         head_df = _to_naive_index(df.head(5))
         heads[symbol] = head_df
 
-        # RESUMEN
         resumen = pd.DataFrame([{
             "activo": symbol,
             "filas": int(df[price_col].count()),
@@ -538,6 +596,20 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
         # STATS
         stats_lr = _compute_stats(logret)
         stats_map[symbol] = stats_lr
+
+        # Calidad de datos
+        if _DQ_OK:
+            try:
+                dq_map[symbol] = data_quality_report(df, freq=freq, price_col=price_col)
+            except Exception as e:
+                print(f"ℹ️ Data quality falló para {symbol}: {e}")
+
+        # Estacionariedad
+        if _STAT_OK:
+            try:
+                stat_tests_map[symbol] = stationarity_tests(df[price_col], name=symbol)
+            except Exception as e:
+                print(f"ℹ️ Stationarity tests fallaron para {symbol}: {e}")
 
         # Modelos ARIMA/SARIMA
         arima_df = None
@@ -564,7 +636,7 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
         except Exception as e:
             print(f"ℹ️ Señales guía no disponibles para {symbol}: {e}")
 
-        # Gráficos
+        # Gráficos base
         p1 = _plot_precio_tendencia(df, price_col, symbol, outdir, win_ma=win_ma)
         p2 = _plot_serie_precio(df, price_col, symbol, outdir)
         p3 = _plot_stl(df, price_col, symbol, outdir, seasonal=_stl_period_by_freq(freq))
@@ -582,11 +654,40 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
             "IMG_05": p5, "IMG_06": p6, "IMG_07": p7, "IMG_08": p8, "IMG_09": p9
         }
 
+        # GARCH (opcional)
+        if _DIAG_OK:
+            try:
+                garch_png = garch_vol_plot(logret, symbol, outdir)
+                if garch_png:
+                    artifacts[symbol]["IMG_10_GARCH"] = garch_png
+            except Exception as e:
+                print(f"ℹ️ GARCH no disponible para {symbol}: {e}")
+
+        # Mapas BIC (si hay candidatos)
+        if _DIAG_OK and arima_df is not None and not arima_df.empty:
+            try:
+                arima_maps = bic_heatmap_arima(arima_df, symbol, outdir)
+                for i, pth in enumerate(arima_maps, start=1):
+                    artifacts[symbol][f"IMG_BIC_ARIMA_{i}"] = pth
+            except Exception as e:
+                print(f"ℹ️ Heatmap ARIMA falló para {symbol}: {e}")
+        if _DIAG_OK and sarima_df is not None and not sarima_df.empty:
+            try:
+                sarima_maps = bic_heatmap_sarima(sarima_df, symbol, outdir)
+                for i, pth in enumerate(sarima_maps, start=1):
+                    artifacts[symbol][f"IMG_BIC_SARIMA_{i}"] = pth
+            except Exception as e:
+                print(f"ℹ️ Heatmap SARIMA falló para {symbol}: {e}")
+
         # Consola
         print(f"— {symbol} —")
         print("HEAD (5 filas):"); print(head_df)
         print("Resumen:"); print(resumen.to_string(index=False))
         print("Stats log-returns:"); print(stats_lr.to_string(index=False))
+        if symbol in dq_map:
+            print("Data Quality:"); print(dq_map[symbol].to_string(index=False))
+        if symbol in stat_tests_map:
+            print("Stationarity:"); print(stat_tests_map[symbol].to_string(index=False))
         print(f"Gráficos guardados en: {outdir}")
         print("-"*60)
 
@@ -604,28 +705,63 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
             corr_df = m.corr()
             _, roll_corr = _plot_rolling_corr(lre, lrs, outdir, window=rc_window,
                                               title_suffix=f"{alias_eur} vs {alias_spy}")
+            if _CCF_OK:
+                try:
+                    plot_ccf(lre, lrs, max_lag=10, outdir=outdir, title=f"CCF {alias_eur} vs {alias_spy}")
+                except Exception as e:
+                    print(f"ℹ️ CCF falló: {e}")
 
-    # Narrativa ejecutiva (elige mejor BIC entre ARIMA y SARIMA)
-    corr_mean = float(roll_corr["rolling_corr"].mean()) if (roll_corr is not None and not roll_corr.empty) else None
-    corr_last = float(roll_corr["rolling_corr"].iloc[-1]) if (roll_corr is not None and not roll_corr.empty) else None
+    # Comparación ARIMA vs SARIMA y narrativa por símbolo
+    best_map: Dict[str, dict] = {}
     for sym in heads.keys():
         ar_df = arima_map.get(sym); sa_df = sarima_map.get(sym)
-        best_txt, best_bic = None, None
-        if ar_df is not None and not ar_df.empty:
-            r0 = ar_df.iloc[0]; best_txt = f"ARIMA({int(r0['p'])},{int(r0['d'])},{int(r0['q'])})"; best_bic = float(r0['bic'])
-        if sa_df is not None and not sa_df.empty:
-            r1 = sa_df.iloc[0]; sar_txt = f"SARIMA({int(r1['p'])},{int(r1['d'])},{int(r1['q'])})x({int(r1['P'])},{int(r1['D'])},{int(r1['Q'])})[{int(r1['s'])}]"
-            if (best_bic is None) or (float(r1['bic']) < best_bic):
-                best_txt, best_bic = sar_txt, float(r1['bic'])
-        narrative_map[sym] = _narrativa_basica(sym, resumenes[sym], stats_map.get(sym),
-                                               best_model_txt=best_txt, corr_mean=corr_mean, corr_last=corr_last)
+        best_txt, best_bic, best_row = None, None, None
+        alt_txt, alt_bic_delta, alt_row = None, None, None
 
-    # Exporta Excel base
+        if ar_df is not None and not ar_df.empty:
+            ar_top = ar_df.iloc[0]
+            ar_txt = f"ARIMA({int(ar_top['p'])},{int(ar_top['d'])},{int(ar_top['q'])})"
+            best_txt, best_bic, best_row = ar_txt, float(ar_top['bic']), ar_top
+
+        if sa_df is not None and not sa_df.empty:
+            sa_top = sa_df.iloc[0]
+            sa_txt = f"SARIMA({int(sa_top['p'])},{int(sa_top['d'])},{int(sa_top['q'])})x({int(sa_top['P'])},{int(sa_top['D'])},{int(sa_top['Q'])})[{int(sa_top['s'])}]"
+            if (best_bic is None) or (float(sa_top['bic']) < best_bic):
+                alt_txt, alt_bic_delta, alt_row = best_txt, (best_bic - float(sa_top['bic'])) if best_bic is not None else None, best_row
+                best_txt, best_bic, best_row = sa_txt, float(sa_top['bic']), sa_top
+            else:
+                alt_txt, alt_bic_delta, alt_row = sa_txt, (float(sa_top['bic']) - best_bic), sa_top
+
+        narrative_map[sym] = _narrativa_basica(sym, resumenes[sym], stats_map.get(sym),
+                                               best_model_txt=best_txt, best_row=best_row,
+                                               alt_model_txt=alt_txt, alt_row=alt_row)
+
+        best_map[sym] = {
+            "best_txt": best_txt, "best_bic": best_bic,
+            "alt_txt": alt_txt, "alt_bic_delta": alt_bic_delta
+        }
+
+        # Diagnóstico de residuales del modelo ganador sobre la serie de PRECIO resampleada
+        if _DIAG_OK and best_txt:
+            try:
+                # reconstruir df resampleado del símbolo
+                base_df = _resample_ohlc(_ensure_dt_index(original_df_map[sym]), freq=freq, price_col=_find_close(original_df_map[sym]))
+                diag = residual_diagnostics(base_df[_find_close(base_df)], best_txt, sym, outdir)
+                resid_diag_map[sym] = pd.DataFrame([{"lb_p_10": diag.get("lb_p_10"), "lb_p_20": diag.get("lb_p_20"), "modelo": best_txt}])
+                artifacts[sym]["IMG_RES_ACF"]  = diag.get("acf_resid")
+                artifacts[sym]["IMG_RES_PACF"] = diag.get("pacf_resid")
+                artifacts[sym]["IMG_RES_QQ"]   = diag.get("qq_resid")
+            except Exception as e:
+                print(f"ℹ️ Residual diagnostics falló para {sym}: {e}")
+
+    # Informe ejecutivo global
+    exec_summary = _build_exec_summary(best_map, corr_df, roll_corr)
+
+    # Exporta Excel base + pestañas extra
     if heads:
         out_xlsx = os.path.join(outdir, "EDA_informe.xlsx")
         _export_excel(out_xlsx, heads, resumenes, stats_map, corr_df, roll_corr)
         print(f"📊 Excel generado: {out_xlsx}")
-        # Añade pestañas extra
         try:
             import openpyxl  # noqa
             with pd.ExcelWriter(out_xlsx, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
@@ -635,47 +771,64 @@ def ejecutar_eda(df_eurusd: pd.DataFrame | None = None,
                 for sym, sa_df in sarima_map.items():
                     if sa_df is not None and not sa_df.empty:
                         sa_df.to_excel(w, sheet_name=f"{sym}_SARIMA_candidates", index=False)
+                # Comparación resumida
+                comp_rows = []
+                for sym, info in best_map.items():
+                    comp_rows.append({
+                        "activo": sym,
+                        "modelo_recomendado": info.get("best_txt"),
+                        "BIC_recomendado": info.get("best_bic"),
+                        "modelo_alternativo": info.get("alt_txt"),
+                        "ΔBIC_alt_vs_best": info.get("alt_bic_delta"),
+                    })
+                pd.DataFrame(comp_rows).to_excel(w, sheet_name="Model_compare_summary", index=False)
+                # Narrativas y señales
                 for sym, txt in narrative_map.items():
                     pd.DataFrame({"Narrativa":[txt]}).to_excel(w, sheet_name=f"{sym}_Narrative", index=False)
                 for sym, sig_df in signals_map.items():
                     if sig_df is not None and not sig_df.empty:
                         sig_df.to_excel(w, sheet_name=f"{sym}_Signals_guide", index=False)
+                for sym, dq in dq_map.items():
+                    dq.to_excel(w, sheet_name=f"{sym}_DATA_QUALITY", index=False)
+                for sym, st in stat_tests_map.items():
+                    st.to_excel(w, sheet_name=f"{sym}_STATIONARITY", index=False)
+                for sym, rd in resid_diag_map.items():
+                    rd.to_excel(w, sheet_name=f"{sym}_Residuals_diag", index=False)
+                # Guía de columnas
+                guide_rows = [
+                    {"Sección":"ARIMA_candidates","Columna":"p,d,q","Significado":"Órdenes no estacionales: AR (p), diferencias (d), MA (q)."},
+                    {"Sección":"ARIMA_candidates","Columna":"bic","Significado":"Criterio de información bayesiano (menor es mejor)."},
+                    {"Sección":"ARIMA_candidates","Columna":"aic","Significado":"Criterio de Akaike (menor es mejor)."},
+                    {"Sección":"ARIMA_candidates","Columna":"lb_p","Significado":"p-value de Ljung–Box en residuales (≥0.05 sugiere ruido blanco)."},
 
-                # Guía de columnas (una sola hoja)
-                try:
-                    guide_rows = [
-                        {"Sección":"ARIMA_candidates","Columna":"p,d,q","Significado":"Órdenes no estacionales: AR (p), diferencias (d), MA (q)."},
-                        {"Sección":"ARIMA_candidates","Columna":"bic","Significado":"Criterio de información bayesiano (menor es mejor)."},
-                        {"Sección":"ARIMA_candidates","Columna":"aic","Significado":"Criterio de Akaike (menor es mejor)."},
-                        {"Sección":"ARIMA_candidates","Columna":"lb_p","Significado":"p-value de Ljung–Box en residuales (≥0.05 sugiere ruido blanco)."},
+                    {"Sección":"SARIMA_candidates","Columna":"p,d,q","Significado":"Parte no estacional del modelo."},
+                    {"Sección":"SARIMA_candidates","Columna":"P,D,Q","Significado":"Parte estacional del modelo (lags a múltiplos de s)."},
+                    {"Sección":"SARIMA_candidates","Columna":"s","Significado":"Periodo estacional (diario: 5=semana hábil, 7=semana)."},
+                    {"Sección":"SARIMA_candidates","Columna":"bic,aic,lb_p","Significado":"Mismos criterios que en ARIMA."},
 
-                        {"Sección":"SARIMA_candidates","Columna":"p,d,q","Significado":"Parte no estacional del modelo."},
-                        {"Sección":"SARIMA_candidates","Columna":"P,D,Q","Significado":"Parte estacional del modelo (lags a múltiplos de s)."},
-                        {"Sección":"SARIMA_candidates","Columna":"s","Significado":"Periodo estacional (diario: 5=semana hábil, 7=semana calendario)."},
-                        {"Sección":"SARIMA_candidates","Columna":"bic,aic,lb_p","Significado":"Mismos criterios que en ARIMA."},
+                    {"Sección":"STATS","Columna":"mean,std","Significado":"Media y desviación típica diaria de log-returns."},
+                    {"Sección":"STATS","Columna":"skew,kurtosis","Significado":"Asimetría y exceso de curtosis (colas)."},
+                    {"Sección":"STATS","Columna":"JB_stat,JB_pvalue","Significado":"Jarque–Bera (p<0.05 ⇒ no normal)."},
+                    {"Sección":"STATS","Columna":"VaR_95,ES_95","Significado":"Pérdida al 95% y pérdida media condicional en el 5% peor."},
 
-                        {"Sección":"STATS","Columna":"mean,std","Significado":"Media y desviación típica diaria de log-returns."},
-                        {"Sección":"STATS","Columna":"skew,kurtosis","Significado":"Asimetría y exceso de curtosis (colas)."},
-                        {"Sección":"STATS","Columna":"JB_stat,JB_pvalue","Significado":"Test de normalidad Jarque–Bera (p<0.05 ⇒ no normal)."},
-                        {"Sección":"STATS","Columna":"VaR_95,ES_95","Significado":"Pérdida al 95% y pérdida media condicional en el 5% peor."},
+                    {"Sección":"RESUMEN","Columna":"precio_ultimo/promedio/min/max","Significado":"Niveles de precio del periodo resampleado."},
+                    {"Sección":"RESUMEN","Columna":"inicio,fin,filas","Significado":"Fechas de cobertura y nº de barras."},
 
-                        {"Sección":"RESUMEN","Columna":"precio_ultimo/promedio/min/max","Significado":"Niveles de precio del periodo resampleado."},
-                        {"Sección":"RESUMEN","Columna":"inicio,fin,filas","Significado":"Fechas de cobertura y nº de barras."},
+                    {"Sección":"Signals_guide","Columna":"Tendencia_MA","Significado":"Cruce SMA50 vs SMA200 (lectura descriptiva)."},
+                    {"Sección":"Signals_guide","Columna":"RSI_14","Significado":"Sobrecompra/sobreventa/neutral (14)."},
+                    {"Sección":"Signals_guide","Columna":"MACD","Significado":"Relación MACD vs señal (12,26,9)."},
 
-                        {"Sección":"Signals_guide","Columna":"Tendencia_MA","Significado":"Cruce SMA50 vs SMA200 (lectura descriptiva)."},
-                        {"Sección":"Signals_guide","Columna":"RSI_14","Significado":"Sobrecompra/sobreventa/neutral (14)."},
-                        {"Sección":"Signals_guide","Columna":"MACD","Significado":"Relación MACD vs señal (12,26,9)."},
-                    ]
-                    pd.DataFrame(guide_rows).to_excel(w, sheet_name="Guide_columns", index=False)
-                except Exception as _ge:
-                    print(f"ℹ️ No se pudo escribir Guide_columns: {_ge}")
+                    {"Sección":"Residuals_diag","Columna":"lb_p_10, lb_p_20","Significado":"Ljung–Box p-value en residuales (lags 10 y 20)."},
+                    {"Sección":"Model_compare_summary","Columna":"ΔBIC_alt_vs_best","Significado":"Diferencia de BIC entre el alternativo y el recomendado (positivo=peor)."},
+                ]
+                pd.DataFrame(guide_rows).to_excel(w, sheet_name="Guide_columns", index=False)
         except Exception as e:
-            print(f"ℹ️ No se pudieron añadir hojas ARIMA/SARIMA/Narrative/Signals: {e}")
+            print(f"ℹ️ No se pudieron añadir hojas extra: {e}")
 
-    # Exporta PDF
+    # Exporta PDF con narrativa por símbolo + informe ejecutivo
     if (cfg or {}).get("eda", {}).get("export_pdf", True):
         _export_pdf(outdir, artifacts, corr_df, roll_corr,
-                    narrative_map=narrative_map,
+                    narrative_map=narrative_map, exec_summary=exec_summary,
                     filename=(cfg or {}).get("eda", {}).get("pdf_filename", "EDA_informe.pdf"))
 
     print("✅ EDA completado.")

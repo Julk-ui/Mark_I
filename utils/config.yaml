@@ -43,3 +43,21 @@ mt5:
   password: "Colombia123*"
   server: "RoboForex-Pro"
   path: "C:\\Program Files\\RoboForex - MetaTrader 5\\terminal64.exe"
+
+bt:
+  initial_train: 1200   # más historial inicial ⇒ menos ventanas
+  step: 40              # reentreno bimensual
+  horizon: 1
+  outxlsx: "outputs/evaluacion.xlsx"
+
+  auto:
+    rescan_each_refit: false    # ← escanea SOLO al inicio
+    rescan_every_refits: 5
+    scan:
+      try_arima: true
+      try_sarima: false         # ← desactiva SARIMA por ahora (mucho más lento)
+      max_p: 2
+      max_q: 2
+      require_lb: true
+      lb_alpha: 0.05
+

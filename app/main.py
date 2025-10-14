@@ -7,6 +7,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Tuple
+from evaluacion.backtest_rolling import evaluate_many, save_backtest_excel
+from procesamiento.eda_crispdm import _ensure_dt_index, _find_close, _resample_ohlc
 
 # ----- Stats/ML -----
 from statsmodels.tsa.arima.model import ARIMA
@@ -43,6 +45,7 @@ try:
     _EDA_OK = True
 except Exception:
     _EDA_OK = False
+
 
 # ==================== MÉTRICAS ====================
 def rmse(y_true, y_pred):
@@ -424,7 +427,7 @@ def obtener_df_desde_mt5(bf: Basic_funcs, symbol: str, timeframe: str, n_barras:
 def main():
     # --- Config / CLI ---
     parser = argparse.ArgumentParser()
-    parser.add_argument("--modo", choices=["normal","eda","modelos","simple"], default="normal")
+    parser.add_argument("--modo", choices=["normal","eda","modelos","simple", "backtest"], default="normal")
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
@@ -510,6 +513,41 @@ def main():
                 print("⚠️ ejecutar_eda no disponible en procesamiento/eda_crispdm.py")
             else:
                 ejecutar_eda(df_eurusd=df, df_spy=None, cfg=config)
+            return
+        elif args.modo == "backtest":
+            # Reutilizamos df obtenido arriba desde MT5
+            df_bt = df.copy()
+            df_bt = _ensure_dt_index(df_bt)
+            price_col = _find_close(df_bt)
+            freq_eda = config.get('eda', {}).get('frecuencia_resampleo', 'D')
+            df_bt = _resample_ohlc(df_bt, freq=freq_eda, price_col=price_col)
+            y = df_bt[price_col]
+
+            # Parámetros de backtest desde config.yaml
+            bt_cfg = config.get("bt", {})
+            initial_train = int(bt_cfg.get("initial_train", 1000))
+            step = int(bt_cfg.get("step", 20))
+            horizon = int(bt_cfg.get("horizon", 1))
+
+            # Modelos a evaluar (RW + AUTO ARIMA/SARIMA)
+            specs = [
+                {"name": "RW", "kind": "rw"},
+                {"name": "AUTO(ARIMA/SARIMA)", "kind": "auto",
+                "scan": bt_cfg.get("auto", {}).get("scan", {}),
+                "rescan_each_refit": bt_cfg.get("auto", {}).get("rescan_each_refit", True),
+                "rescan_every_refits": bt_cfg.get("auto", {}).get("rescan_every_refits", 1)}
+            ]
+
+            # Backtest
+            summary, preds_map = evaluate_many(
+                y, specs,
+                initial_train=initial_train, step=step, horizon=horizon
+            )
+
+            # Exportar
+            outxlsx = bt_cfg.get("outxlsx", "outputs/evaluacion.xlsx")
+            save_backtest_excel(outxlsx, summary, preds_map)
+            print(summary.to_string(index=False))
             return
 
         # ---------- MODO: SIMPLE (backtest 1 split + Excel/PDF simples, CON Prophet) ----------

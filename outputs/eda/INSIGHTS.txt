@@ -1,5 +1,0 @@
-[EURUSD] Volatilidad anualizada 8.48%; sesgo Mean-Reversion; Máx. drawdown -1.10%.
-[EURUSD] Sugerencia SL~8.48% del precio; TP~16.96% (ajustar por liquidez/activo).
-[SPY] Volatilidad anualizada 10.94%; sin sesgo claro; Máx. drawdown -2.08%.
-[SPY] Sugerencia SL~10.94% del precio; TP~21.89% (ajustar por liquidez/activo).
-[Diversificación] Corr(EURUSD, SPY)=0.50.
