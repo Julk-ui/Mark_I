@@ -1,19 +1,12 @@
 # === Configuración General ===
 simbolo: "EURUSD"
-timeframe: "D1"                  # ← barras diarias
-cantidad_datos: 2000             # ← ~8 años (2000 días hábiles aprox.) para tener buen histórico
+timeframe: "D1"
+cantidad_datos: 2000
 
-# Modelo activo
-modelo: "auto"                   # "prophet" o "auto" (comparativo RW/ARIMA/ETS/LSTM/Prophet si está disponible)
-pasos_prediccion: 20             # ← ~1 mes de trading (20 días hábiles)
-frecuencia_prediccion: "1D"      # ← predicción a 1 día
-umbral_senal: 0.0010             # ← ~10 pips en EURUSD para señales diarias
-
-# === Parámetros de Trading ===
-riesgo_por_trade: 0.02
-volumen_minimo: 0.01
-stop_loss_pips: 100              # (diario suele requerir SL/TP mayores que en M5)
-take_profit_pips: 200
+modelo: "auto"
+pasos_prediccion: 20
+frecuencia_prediccion: "1D"
+umbral_senal: 0.0010
 pip_size: 0.0001
 
 # === Reportes ===
@@ -22,42 +15,61 @@ ruta_reporte: "outputs/reporte_inversion.xlsx"
 # === EDA (CRISP-DM) ===
 eda:
   habilitar: true
-  frecuencia_resampleo: "D"      # ← EDA en diario
+  frecuencia_resampleo: "D"
   outdir: "outputs/eda"
   ventana_media_movil: 30
-  acf_lags: 60                   # ← un poco más largo en diario
+  acf_lags: 60
   rolling_vol_windows: [20, 60, 120]
-  rolling_corr_window: 120       # ← 6 meses en diario
+  rolling_corr_window: 120
   export_pdf: true
   pdf_filename: "EDA_informe.pdf"
   alias_eur: "EURUSD"
   alias_spy: "US500"
 
-# === SPY para EDA (elige UNA opción) ===
+# === SPY para EDA ===
 simbolo_spy: ".US500Cash"
-# spy_csv: "data/spy.csv"
 
-# === Credenciales / terminal MT5 ===
+# === MT5 ===
 mt5:
   login: 68238343
   password: "Colombia123*"
   server: "RoboForex-Pro"
   path: "C:\\Program Files\\RoboForex - MetaTrader 5\\terminal64.exe"
 
+# === Backtest ===
 bt:
-  initial_train: 1200   # más historial inicial ⇒ menos ventanas
-  step: 40              # reentreno bimensual
+  target: "returns"           # retornos (Δlog)
+  initial_train: 1200
+  step: 5
   horizon: 1
+  pip_size: 0.0001
+
+  # UMBRAL (elige uno u otro en threshold_mode)
+  threshold_mode: "garch"       # "fixed" | "atr" | "garch"
+  threshold_pips: 6         # si mode=fixed
+  atr_window: 14              # si mode=atr
+  atr_k: 0.25                 # si mode=atr (sensibilidad)
+  min_threshold_pips: 4     # piso mínimo de pips (atr/garch)
+  garch_k: 1.0               # si mode=garch: sensibilidad sobre sigma_t+1 (pips)
+
+  # Guardar detalle y log de umbrales
+  save_detail: true
+  log_threshold_used: true
+
+  decision:
+    type: "zscore"   # "pips" (actual), o "zscore" para activar la regla por z
+    z_thr: 0.20    # umbral de z (sólo usado si type="zscore")
+
   outxlsx: "outputs/evaluacion.xlsx"
+  outdir_plots: "outputs/backtest_plots"
 
   auto:
-    rescan_each_refit: false    # ← escanea SOLO al inicio
-    rescan_every_refits: 5
     scan:
-      try_arima: true
-      try_sarima: false         # ← desactiva SARIMA por ahora (mucho más lento)
-      max_p: 2
-      max_q: 2
-      require_lb: true
-      lb_alpha: 0.05
-
+      try_sarima: true
+      max_p: 1
+      max_q: 1  
+      max_P: 0
+      max_Q: 1
+      s_candidates: [5]
+    rescan_each_refit: false
+    rescan_every_refits: 20

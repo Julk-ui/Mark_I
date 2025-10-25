@@ -55,18 +55,6 @@ except Exception as _e:
     _DIAG_OK = False
     print(f"ℹ️ Módulo diagnostics no disponible ({_e}).")
 
-# import robusto para CCF
-try:
-    from procesamiento.ccf import plot_ccf
-    _CCF_OK = True
-except Exception:
-    try:
-        from .ccf import plot_ccf
-        _CCF_OK = True
-    except Exception as _e:
-        _CCF_OK = False
-        print(f"ℹ️ Módulo ccf no disponible ({_e}).")
-
 
 # =======================
 # Utilidades
@@ -327,7 +315,6 @@ def _plot_rolling_corr(df_eur_lr, df_spy_lr, outdir, window=60, title_suffix="EU
 # =======================
 def _export_excel(outpath: str, heads: dict, resumenes: dict, stats_map: dict,
                   corr_df: Optional[pd.DataFrame], roll_corr: Optional[pd.DataFrame]) -> None:
-    # Motor preferido
     try:
         import xlsxwriter  # noqa
         writer_kwargs = {"engine": "xlsxwriter", "datetime_format": "yyyy-mm-dd hh:mm"}
@@ -541,7 +528,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
     alias_spy = eda_cfg.get("alias_spy", "SPY")
     _safe_mkdir(outdir)
 
-    # Mapa para acceder al df original por símbolo (para diagnósticos posteriores)
     original_df_map: Dict[str, pd.DataFrame] = {}
     if df_eurusd is not None:
         original_df_map[alias_eur] = df_eurusd.copy()
@@ -562,7 +548,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
     resid_diag_map: Dict[str, pd.DataFrame] = {}
     compare_summary_map: Dict[str, dict] = {}
 
-    # --- Por activo ---
     for symbol, df in activos:
         if df is None:
             continue
@@ -571,11 +556,9 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
         price_col = _find_close(df)
         df = _resample_ohlc(df, freq=freq, price_col=price_col)
 
-        # Derivadas
         ret, logret = _compute_returns_blocks(df, price_col)
         atr = _atr_if_available(df)
 
-        # HEAD y RESUMEN
         head_df = _to_naive_index(df.head(5))
         heads[symbol] = head_df
 
@@ -593,25 +576,21 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
         resumen["fin"]   = pd.to_datetime(resumen["fin"],   utc=True).dt.tz_localize(None)
         resumenes[symbol] = resumen
 
-        # STATS
         stats_lr = _compute_stats(logret)
         stats_map[symbol] = stats_lr
 
-        # Calidad de datos
         if _DQ_OK:
             try:
                 dq_map[symbol] = data_quality_report(df, freq=freq, price_col=price_col)
             except Exception as e:
                 print(f"ℹ️ Data quality falló para {symbol}: {e}")
 
-        # Estacionariedad
         if _STAT_OK:
             try:
                 stat_tests_map[symbol] = stationarity_tests(df[price_col], name=symbol)
             except Exception as e:
                 print(f"ℹ️ Stationarity tests fallaron para {symbol}: {e}")
 
-        # Modelos ARIMA/SARIMA
         arima_df = None
         if _ARIMA_SCAN_OK:
             try:
@@ -628,7 +607,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
                 print(f"ℹ️ SARIMA scan falló para {symbol}: {e}")
         sarima_map[symbol] = sarima_df
 
-        # Señales guía
         try:
             sig_df = _signals_from_series(df, price_col)
             if sig_df is not None and not sig_df.empty:
@@ -636,7 +614,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
         except Exception as e:
             print(f"ℹ️ Señales guía no disponibles para {symbol}: {e}")
 
-        # Gráficos base
         p1 = _plot_precio_tendencia(df, price_col, symbol, outdir, win_ma=win_ma)
         p2 = _plot_serie_precio(df, price_col, symbol, outdir)
         p3 = _plot_stl(df, price_col, symbol, outdir, seasonal=_stl_period_by_freq(freq))
@@ -654,7 +631,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
             "IMG_05": p5, "IMG_06": p6, "IMG_07": p7, "IMG_08": p8, "IMG_09": p9
         }
 
-        # GARCH (opcional)
         if _DIAG_OK:
             try:
                 garch_png = garch_vol_plot(logret, symbol, outdir)
@@ -663,7 +639,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
             except Exception as e:
                 print(f"ℹ️ GARCH no disponible para {symbol}: {e}")
 
-        # Mapas BIC (si hay candidatos)
         if _DIAG_OK and arima_df is not None and not arima_df.empty:
             try:
                 arima_maps = bic_heatmap_arima(arima_df, symbol, outdir)
@@ -679,7 +654,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
             except Exception as e:
                 print(f"ℹ️ Heatmap SARIMA falló para {symbol}: {e}")
 
-        # Consola
         print(f"— {symbol} —")
         print("HEAD (5 filas):"); print(head_df)
         print("Resumen:"); print(resumen.to_string(index=False))
@@ -691,25 +665,7 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
         print(f"Gráficos guardados en: {outdir}")
         print("-"*60)
 
-    # Correlación si hay ambos
     corr_df = roll_corr = None
-    if (df_eurusd is not None) and (df_spy is not None):
-        dfe = _resample_ohlc(_ensure_dt_index(df_eurusd), freq=freq, price_col=_find_close(df_eurusd))
-        _, lre = _compute_returns_blocks(dfe, _find_close(dfe))
-        dfs = _resample_ohlc(_ensure_dt_index(df_spy), freq=freq, price_col=_find_close(df_spy))
-        _, lrs = _compute_returns_blocks(dfs, _find_close(dfs))
-        m = lre.dropna().rename(f"lr_{alias_eur}").to_frame().join(
-            lrs.dropna().rename(f"lr_{alias_spy}").to_frame(), how="inner"
-        ).dropna()
-        if not m.empty:
-            corr_df = m.corr()
-            _, roll_corr = _plot_rolling_corr(lre, lrs, outdir, window=rc_window,
-                                              title_suffix=f"{alias_eur} vs {alias_spy}")
-            if _CCF_OK:
-                try:
-                    plot_ccf(lre, lrs, max_lag=10, outdir=outdir, title=f"CCF {alias_eur} vs {alias_spy}")
-                except Exception as e:
-                    print(f"ℹ️ CCF falló: {e}")
 
     # Comparación ARIMA vs SARIMA y narrativa por símbolo
     best_map: Dict[str, dict] = {}
@@ -741,10 +697,8 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
             "alt_txt": alt_txt, "alt_bic_delta": alt_bic_delta
         }
 
-        # Diagnóstico de residuales del modelo ganador sobre la serie de PRECIO resampleada
         if _DIAG_OK and best_txt:
             try:
-                # reconstruir df resampleado del símbolo
                 base_df = _resample_ohlc(_ensure_dt_index(original_df_map[sym]), freq=freq, price_col=_find_close(original_df_map[sym]))
                 diag = residual_diagnostics(base_df[_find_close(base_df)], best_txt, sym, outdir)
                 resid_diag_map[sym] = pd.DataFrame([{"lb_p_10": diag.get("lb_p_10"), "lb_p_20": diag.get("lb_p_20"), "modelo": best_txt}])
@@ -754,10 +708,8 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
             except Exception as e:
                 print(f"ℹ️ Residual diagnostics falló para {sym}: {e}")
 
-    # Informe ejecutivo global
     exec_summary = _build_exec_summary(best_map, corr_df, roll_corr)
 
-    # Exporta Excel base + pestañas extra
     if heads:
         out_xlsx = os.path.join(outdir, "EDA_informe.xlsx")
         _export_excel(out_xlsx, heads, resumenes, stats_map, corr_df, roll_corr)
@@ -771,7 +723,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
                 for sym, sa_df in sarima_map.items():
                     if sa_df is not None and not sa_df.empty:
                         sa_df.to_excel(w, sheet_name=f"{sym}_SARIMA_candidates", index=False)
-                # Comparación resumida
                 comp_rows = []
                 for sym, info in best_map.items():
                     comp_rows.append({
@@ -782,7 +733,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
                         "ΔBIC_alt_vs_best": info.get("alt_bic_delta"),
                     })
                 pd.DataFrame(comp_rows).to_excel(w, sheet_name="Model_compare_summary", index=False)
-                # Narrativas y señales
                 for sym, txt in narrative_map.items():
                     pd.DataFrame({"Narrativa":[txt]}).to_excel(w, sheet_name=f"{sym}_Narrative", index=False)
                 for sym, sig_df in signals_map.items():
@@ -794,30 +744,24 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
                     st.to_excel(w, sheet_name=f"{sym}_STATIONARITY", index=False)
                 for sym, rd in resid_diag_map.items():
                     rd.to_excel(w, sheet_name=f"{sym}_Residuals_diag", index=False)
-                # Guía de columnas
                 guide_rows = [
                     {"Sección":"ARIMA_candidates","Columna":"p,d,q","Significado":"Órdenes no estacionales: AR (p), diferencias (d), MA (q)."},
                     {"Sección":"ARIMA_candidates","Columna":"bic","Significado":"Criterio de información bayesiano (menor es mejor)."},
                     {"Sección":"ARIMA_candidates","Columna":"aic","Significado":"Criterio de Akaike (menor es mejor)."},
                     {"Sección":"ARIMA_candidates","Columna":"lb_p","Significado":"p-value de Ljung–Box en residuales (≥0.05 sugiere ruido blanco)."},
-
                     {"Sección":"SARIMA_candidates","Columna":"p,d,q","Significado":"Parte no estacional del modelo."},
                     {"Sección":"SARIMA_candidates","Columna":"P,D,Q","Significado":"Parte estacional del modelo (lags a múltiplos de s)."},
                     {"Sección":"SARIMA_candidates","Columna":"s","Significado":"Periodo estacional (diario: 5=semana hábil, 7=semana)."},
                     {"Sección":"SARIMA_candidates","Columna":"bic,aic,lb_p","Significado":"Mismos criterios que en ARIMA."},
-
                     {"Sección":"STATS","Columna":"mean,std","Significado":"Media y desviación típica diaria de log-returns."},
                     {"Sección":"STATS","Columna":"skew,kurtosis","Significado":"Asimetría y exceso de curtosis (colas)."},
                     {"Sección":"STATS","Columna":"JB_stat,JB_pvalue","Significado":"Jarque–Bera (p<0.05 ⇒ no normal)."},
                     {"Sección":"STATS","Columna":"VaR_95,ES_95","Significado":"Pérdida al 95% y pérdida media condicional en el 5% peor."},
-
                     {"Sección":"RESUMEN","Columna":"precio_ultimo/promedio/min/max","Significado":"Niveles de precio del periodo resampleado."},
                     {"Sección":"RESUMEN","Columna":"inicio,fin,filas","Significado":"Fechas de cobertura y nº de barras."},
-
                     {"Sección":"Signals_guide","Columna":"Tendencia_MA","Significado":"Cruce SMA50 vs SMA200 (lectura descriptiva)."},
                     {"Sección":"Signals_guide","Columna":"RSI_14","Significado":"Sobrecompra/sobreventa/neutral (14)."},
                     {"Sección":"Signals_guide","Columna":"MACD","Significado":"Relación MACD vs señal (12,26,9)."},
-
                     {"Sección":"Residuals_diag","Columna":"lb_p_10, lb_p_20","Significado":"Ljung–Box p-value en residuales (lags 10 y 20)."},
                     {"Sección":"Model_compare_summary","Columna":"ΔBIC_alt_vs_best","Significado":"Diferencia de BIC entre el alternativo y el recomendado (positivo=peor)."},
                 ]
@@ -825,7 +769,6 @@ def ejecutar_eda(df_eurusd: Optional[pd.DataFrame] = None,
         except Exception as e:
             print(f"ℹ️ No se pudieron añadir hojas extra: {e}")
 
-    # Exporta PDF con narrativa por símbolo + informe ejecutivo
     if (cfg or {}).get("eda", {}).get("export_pdf", True):
         _export_pdf(outdir, artifacts, corr_df, roll_corr,
                     narrative_map=narrative_map, exec_summary=exec_summary,

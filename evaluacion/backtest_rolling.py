@@ -1,442 +1,592 @@
 # evaluacion/backtest_rolling.py
-"""
-Backtesting rolling-origin (expanding window) para modelos 1D:
-- Baseline Random Walk (naive last)
-- SARIMAX (ARIMA/SARIMA) con statsmodels
-- (Opcional) ETS si statsmodels.holtwinters disponible
-
-Incluye modo AUTO: re-selecciona dinámicamente ARIMA o SARIMA por BIC (y opcional Ljung–Box) en cada reentreno,
-usando únicamente datos pasados (sin leakage).
-
-Métricas: RMSE, MAE, MAPE, sMAPE, R^2, HitRate direccional.
-Exporta Excel con resumen y hojas de predicciones por modelo.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
+# -*- coding: utf-8 -*-
+import os
+import re
+import time
+import math
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Any, Optional
 
-# --- opcionales ---
-try:
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-    _SM_OK = True
-except Exception as _e:
-    SARIMAX = None  # type: ignore
-    _SM_OK = False
-    print(f"ℹ️ SARIMAX no disponible ({_e}).")
-
-try:
-    from statsmodels.tsa.holtwinters import ExponentialSmoothing
-    _ETS_OK = True
-except Exception:
-    ExponentialSmoothing = None  # type: ignore
-    _ETS_OK = False
-
-# Scanners ARIMA/SARIMA (opcional)
-try:
-    from modelos.arima_scan import escanear_arima
-    _ARIMA_SCAN_OK = True
-except Exception as _e:
-    _ARIMA_SCAN_OK = False
-    print(f"ℹ️ ARIMA scan no disponible ({_e}).")
-
-try:
-    from modelos.sarima_scan import escanear_sarima
-    _SARIMA_SCAN_OK = True
-except Exception as _e:
-    _SARIMA_SCAN_OK = False
-    print(f"ℹ️ SARIMA scan no disponible ({_e}).")
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 
 # =========================
-# Métricas
+# Helpers
 # =========================
-def _safe_div(a: float, b: float) -> float:
-    return float(a) / float(b) if b not in (0, 0.0, -0.0) else np.nan
-
-def metrics_regression(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, float]:
-    y_true = pd.Series(y_true).astype(float).dropna()
-    y_pred = pd.Series(y_pred).astype(float).reindex(y_true.index).dropna()
-    y_true = y_true.reindex(y_pred.index)
-
-    err = y_true - y_pred
-    mae = float(np.mean(np.abs(err)))
-    rmse = float(np.sqrt(np.mean(err**2)))
-    mape = float(np.mean(np.abs(err / y_true.replace(0, np.nan)))) * 100.0
-    smape = float(np.mean(2.0 * np.abs(err) / (np.abs(y_true) + np.abs(y_pred)).replace(0, np.nan))) * 100.0
-    # R^2
-    ss_res = float(np.sum(err**2))
-    ss_tot = float(np.sum((y_true - y_true.mean())**2))
-    r2 = 1.0 - _safe_div(ss_res, ss_tot)
-
-    # Dirección (aciertos de signo vs variación real basada en y_{t-1})
-    base = y_true.shift(1)
-    real_up = np.sign(y_true - base)
-    pred_up = np.sign(y_pred - base)
-    hit = float(np.mean((real_up == pred_up).dropna())) * 100.0
-
-    return {"RMSE": rmse, "MAE": mae, "MAPE": mape, "sMAPE": smape, "R2": r2, "HitRate": hit}
-
-
-# =========================
-# Backtesting core
-# =========================
-@dataclass
-class BacktestResult:
-    metrics: Dict[str, float]
-    preds: pd.DataFrame  # columns: ['y_true','y_hat']
-
-def _ensure_series(y: pd.Series) -> pd.Series:
-    s = pd.Series(y).dropna()
-    if not isinstance(s.index, pd.DatetimeIndex):
-        s.index = pd.to_datetime(s.index, errors="coerce")
-    s = s.sort_index()
-    return s
-
-def _rw_forecast(y_hist: pd.Series, horizon: int) -> float:
-    """Random Walk (naive last): pronostica el último valor conocido."""
-    last = float(y_hist.iloc[-1])
-    return last
-
-def _fit_predict_sarimax(y_hist: pd.Series, steps: int,
-                         order: Tuple[int,int,int],
-                         seasonal_order: Optional[Tuple[int,int,int,int]] = None,
-                         enforce_stationarity: bool = False,
-                         enforce_invertibility: bool = False) -> np.ndarray:
-    if not _SM_OK:
-        raise RuntimeError("statsmodels SARIMAX no está disponible.")
-    model = SARIMAX(y_hist, order=order, seasonal_order=seasonal_order or (0,0,0,0),
-                    enforce_stationarity=enforce_stationarity, enforce_invertibility=enforce_invertibility)
-    res = model.fit(disp=False)
-    fc = res.get_forecast(steps=steps).predicted_mean.values
-    return fc
-
-
-# --------- AUTO selector (ARIMA vs SARIMA) ---------
-def select_best_sarimax(y_hist: pd.Series, scan_cfg: dict | None = None) -> dict:
+def _pred_ret_to_pips(y_pred_ret: float, price_t: float, pip_size: float, use_exp: bool = True) -> float:
     """
-    Escanea ARIMA y/o SARIMA y devuelve el mejor por BIC usando SOLO historial.
-    scan_cfg:
-      try_arima: bool (default True)
-      try_sarima: bool (default True)
-      max_p,max_q (ARIMA); max_P,max_Q (SARIMA); s_candidates; require_lb; lb_alpha
+    Convierte retorno predicho (Δlog) a pips respecto a price_t.
+    use_exp=True: y_pred_price = P_t * exp(ret) (más correcto para Δlog)
+    use_exp=False: aproximación lineal ret * P_t.
     """
-    scan_cfg = scan_cfg or {}
-    try_arima = bool(scan_cfg.get("try_arima", True))
+    if price_t is None or pip_size is None or pip_size <= 0:
+        return np.nan
+    if np.isnan(y_pred_ret):
+        return np.nan
+    if use_exp:
+        y_pred_price = price_t * float(np.exp(y_pred_ret))
+        delta = y_pred_price - price_t
+    else:
+        delta = float(y_pred_ret) * price_t
+    return float(delta / pip_size)
+
+
+def _decide_signal_by_rule(y_pred_ret: float,
+                           price_t: float,
+                           pip_size: float,
+                           decision_cfg: dict,
+                           thr_pips: float,
+                           sigma_next_pips: Optional[float]) -> tuple[float, int, float]:
+    """
+    Devuelve: (y_pred_pips, signal, z_used)
+    - decision_cfg['type']: "pips" (por defecto) o "zscore"
+    - thr_pips: umbral en pips (ya calculado con fixed/atr/garch)
+    - sigma_next_pips: sigma prevista en pips (si existe), usada en zscore
+    """
+    y_pred_pips = _pred_ret_to_pips(y_pred_ret, price_t, pip_size, use_exp=True)
+    decision_type = str((decision_cfg or {}).get("type", "pips")).lower()
+    z_used = np.nan
+
+    if decision_type == "pips":
+        fire = bool(abs(y_pred_pips) >= float(thr_pips))
+    else:
+        z_thr = float((decision_cfg or {}).get("z_thr", 0.30))
+        if sigma_next_pips is None or not np.isfinite(sigma_next_pips) or sigma_next_pips <= 0:
+            fire = bool(abs(y_pred_pips) >= float(thr_pips))
+        else:
+            z_used = float(abs(y_pred_pips) / sigma_next_pips)
+            fire = bool(z_used >= z_thr)
+
+    signal = int(np.sign(y_pred_pips)) if fire else 0
+    return y_pred_pips, signal, z_used
+
+
+def _safe_mkdir(p: str):
+    if p and not os.path.exists(p):
+        os.makedirs(p, exist_ok=True)
+
+
+def _sheet_name_safe(name: str) -> str:
+    """Excel no acepta '[]:*?/\\' ni >31 chars."""
+    name = re.sub(r"[\[\]\:\*\?\/\\']", "_", str(name))
+    if len(name) > 31:
+        name = name[:31]
+    if not name:
+        name = "Sheet"
+    return name
+
+
+def _file_name_safe(name: str) -> str:
+    return re.sub(r"[\[\]\:\*\?\/\\']", "_", str(name))
+
+
+def _rmse(y_true, y_pred) -> float:
+    return float(math.sqrt(mean_squared_error(y_true, y_pred))) if len(y_true) else float("nan")
+
+
+def _mae(y_true, y_pred) -> float:
+    return float(mean_absolute_error(y_true, y_pred)) if len(y_true) else float("nan")
+
+
+def _r2(y_true, y_pred) -> float:
+    try:
+        return float(r2_score(y_true, y_pred)) if len(y_true) else float("nan")
+    except Exception:
+        return float("nan")
+
+
+def _drawdown(series: pd.Series) -> pd.Series:
+    cummax = series.cummax()
+    return series - cummax  # en pips
+
+
+def _sign(x: float) -> int:
+    if x > 0: return 1
+    if x < 0: return -1
+    return 0
+
+
+def _make_exog_lags(exog_ret: pd.Series, lags: List[int]) -> Optional[pd.DataFrame]:
+    """Construye lags de exógena (rendimientos US500 por ejemplo)."""
+    if exog_ret is None or not isinstance(exog_ret, (pd.Series, pd.DataFrame)) or not lags:
+        return None
+    if isinstance(exog_ret, pd.DataFrame):
+        s = exog_ret.iloc[:, 0].copy()
+    else:
+        s = exog_ret.copy()
+    out = {}
+    for L in lags:
+        out[f"exog_lag{L}"] = s.shift(L)
+    X = pd.DataFrame(out)
+    return X
+
+
+# =========================
+# Scans ARIMA / SARIMA (simple y robusto)
+# =========================
+def _scan_arima_returns(y: pd.Series, max_p=3, max_q=3, d=0, exog=None) -> Tuple[Tuple[int,int,int], float]:
+    """
+    Busca ARIMA(p,d,q) ligero por BIC. Evita el caso 0,0,0 sin
+    modificar variables del bucle (bug frecuente).
+    """
+    best = None
+    best_bic = float("inf")
+    for p in range(max_p + 1):
+        for q in range(max_q + 1):
+            p_ = p
+            q_ = q
+            if (p_ + q_) == 0:
+                p_ = 1  # evita ARIMA(0,0,0) pero sin tocar 'p' del for
+            try:
+                model = SARIMAX(y, order=(p_, d, q_), exog=exog, trend="n",
+                                enforce_stationarity=False, enforce_invertibility=False)
+                res = model.fit(disp=False)
+                bic = float(res.bic)
+                if bic < best_bic:
+                    best_bic = bic
+                    best = (p_, d, q_)
+            except Exception:
+                continue
+    if best is None:
+        best = (0, d, 0)
+        best_bic = float("inf")
+    return best, best_bic
+
+
+def _scan_sarima_returns(y: pd.Series,
+                         s_candidates=(5, 7),
+                         max_p=2, max_q=2, max_P=1, max_Q=1,
+                         d=0, D=0, exog=None) -> Tuple[Tuple[int,int,int,int,int,int,int], float]:
+    """
+    Busca SARIMA(p,d,q)x(P,D,Q)[s] por BIC, evitando el todo-cero sin
+    tocar variables de los bucles.
+    """
+    best = None
+    best_bic = float("inf")
+    for s in s_candidates:
+        for p in range(max_p + 1):
+            for q in range(max_q + 1):
+                for P in range(max_P + 1):
+                    for Q in range(max_Q + 1):
+                        p_, q_, P_, Q_ = p, q, P, Q
+                        if (p_ + q_ + P_ + Q_) == 0:
+                            p_ = 1  # evita SARIMA(0,0,0)x(0,0,0)[s]
+                        try:
+                            model = SARIMAX(y, order=(p_, d, q_), seasonal_order=(P_, D, Q_, s),
+                                            exog=exog, trend="n",
+                                            enforce_stationarity=False, enforce_invertibility=False)
+                            res = model.fit(disp=False)
+                            bic = float(res.bic)
+                            if bic < best_bic:
+                                best_bic = bic
+                                best = (p_, d, q_, P_, D, Q_, s)
+                        except Exception:
+                            continue
+    if best is None:
+        best = (0, d, 0, 0, D, 0, s_candidates[0])
+        best_bic = float("inf")
+    return best, best_bic
+
+
+# =========================
+# Umbrales
+# =========================
+def _resolve_threshold(date_idx: pd.Timestamp,
+                       mode: str,
+                       fixed_pips: float,
+                       min_threshold_pips: float,
+                       atr_pips: pd.Series = None,
+                       atr_k: float = 0.6,
+                       garch_sigma_pips: pd.Series = None,
+                       garch_k: float = 0.6) -> float:
+    """
+    Devuelve el umbral en pips para la fecha de corte.
+    - fixed: valor fijo.
+    - atr: atr_k * ATR(date) [pips], con piso.
+    - garch: garch_k * sigma_garch(date) [pips], con piso.
+    """
+    mode = (mode or "fixed").lower()
+    thr = fixed_pips
+    if mode == "atr" and atr_pips is not None:
+        val = float(atr_pips.reindex([date_idx]).ffill().iloc[-1])
+        thr = atr_k * val
+    elif mode == "garch" and garch_sigma_pips is not None:
+        val = float(garch_sigma_pips.reindex([date_idx]).ffill().iloc[-1])
+        thr = garch_k * val
+    thr = max(float(thr), float(min_threshold_pips))
+    return float(thr)
+
+
+# =========================
+# Rolling backtest core
+# =========================
+def _rolling_windows_index(n: int, initial_train: int, step: int, horizon: int) -> List[Tuple[int,int,int]]:
+    out = []
+    i = initial_train - 1
+    while i + horizon < n:
+        end_train = i
+        end_test = i + horizon
+        start_train = 0
+        out.append((start_train, end_train, end_test))
+        i += step
+    return out
+
+
+def _fit_and_forecast(y_train: pd.Series,
+                      y_test_next_idx: pd.Timestamp,
+                      spec: dict,
+                      exog_train: Optional[pd.DataFrame] = None,
+                      exog_next: Optional[pd.DataFrame] = None) -> Tuple[float, str]:
+    """
+    Entrena y predice 1 paso.
+    spec['kind'] = 'rw' | 'auto' (por ejemplo) — si 'rw' devuelve 0.
+    """
+    kind = str(spec.get("kind", "rw")).lower()
+    if kind == "rw":
+        return 0.0, "RW"
+
+    scan_cfg = (spec.get("scan") or {})
     try_sarima = bool(scan_cfg.get("try_sarima", True))
-    cand = []
+    max_p = int(scan_cfg.get("max_p", 3))
+    max_q = int(scan_cfg.get("max_q", 3))
+    max_P = int(scan_cfg.get("max_P", 1))
+    max_Q = int(scan_cfg.get("max_Q", 1))
+    s_candidates = scan_cfg.get("s_candidates", [5, 7])
 
-    if try_arima and _ARIMA_SCAN_OK:
+    best_txt = None
+    res = None
+
+    exog_tr = exog_train
+    exog_te = exog_next
+    trend = "n"  # en retornos, lo más sano es sin constante
+
+    if try_sarima:
+        order_seas, _ = _scan_sarima_returns(y_train, s_candidates=s_candidates,
+                                             max_p=max_p, max_q=max_q, max_P=max_P, max_Q=max_Q,
+                                             d=0, D=0, exog=exog_tr)
+        p, d, q, P, D, Q, s = order_seas
         try:
-            ar_df = escanear_arima(y_hist, max_p=scan_cfg.get("max_p", 3), max_q=scan_cfg.get("max_q", 3))
-            if ar_df is not None and not ar_df.empty:
-                r = ar_df.iloc[0]
-                cand.append(("ARIMA", (int(r["p"]), int(r["d"]), int(r["q"])), None, float(r["bic"]), r.get("lb_p", np.nan)))
-        except Exception as e:
-            print(f"ℹ️ select_best: ARIMA scan falló: {e}")
+            model = SARIMAX(y_train, order=(p, d, q), seasonal_order=(P, D, Q, s),
+                            exog=exog_tr, trend=trend,
+                            enforce_stationarity=False, enforce_invertibility=False)
+            res = model.fit(disp=False)
+            best_txt = f"SARIMA({p}, {d}, {q})x({P}, {D}, {Q})[{s}]"
+        except Exception:
+            res = None
 
-    if try_sarima and _SARIMA_SCAN_OK:
+    if res is None:
+        order, _ = _scan_arima_returns(y_train, max_p=max_p, max_q=max_q, d=0, exog=exog_tr)
+        p, d, q = order
         try:
-            sa_df = escanear_sarima(
-                y_hist,
-                s_candidates=scan_cfg.get("s_candidates", [5, 7]),
-                max_p=scan_cfg.get("max_p", 2), max_q=scan_cfg.get("max_q", 2),
-                max_P=scan_cfg.get("max_P", 1), max_Q=scan_cfg.get("max_Q", 1),
-            )
-            if sa_df is not None and not sa_df.empty:
-                r = sa_df.iloc[0]
-                cand.append(("SARIMA", (int(r["p"]), int(r["d"]), int(r["q"])),
-                             (int(r["P"]), int(r["D"]), int(r["Q"]), int(r["s"])),
-                             float(r["bic"]), r.get("lb_p", np.nan)))
-        except Exception as e:
-            print(f"ℹ️ select_best: SARIMA scan falló: {e}")
+            model = SARIMAX(y_train, order=(p, d, q), exog=exog_tr, trend=trend,
+                            enforce_stationarity=False, enforce_invertibility=False)
+            res = model.fit(disp=False)
+            best_txt = f"ARIMA({p}, {d}, {q})"
+        except Exception:
+            return 0.0, "RW"
 
-    if not cand:
-        return {"name":"ARIMA(1,1,1)","kind":"sarimax","order":(1,1,1),"seasonal_order":None,"bic":np.nan,"lb_p":np.nan}
+    try:
+        y_pred = res.get_forecast(steps=1, exog=exog_te).predicted_mean.iloc[0]
+        y_pred = float(y_pred)
+    except Exception:
+        y_pred = 0.0
+        best_txt = (best_txt or "") + " [fallback]"
 
-    require_lb = bool(scan_cfg.get("require_lb", False))
-    lb_alpha   = float(scan_cfg.get("lb_alpha", 0.05))
-    pool = [c for c in cand if (not require_lb) or (c[4] is not None and not pd.isna(c[4]) and float(c[4]) >= lb_alpha)]
-    if not pool: pool = cand
-
-    best = min(pool, key=lambda t: t[3])
-    name = f"ARIMA{best[1]}" if best[0]=="ARIMA" else f"SARIMA{best[1]}x{best[2][:3]}[{best[2][3]}]"
-    return {"name": name, "kind":"sarimax", "order": best[1], "seasonal_order": best[2], "bic": best[3], "lb_p": best[4]}
-
-def rolling_backtest_sarimax(y: pd.Series,
-                             order: Tuple[int,int,int],
-                             seasonal_order: Optional[Tuple[int,int,int,int]] = None,
-                             initial_train: int = 1000,
-                             step: int = 20,
-                             horizon: int = 1) -> tuple[Dict[str,float], pd.DataFrame]:
-    """Backtest expanding-window (rolling origin) con orden fijo."""
-    y = _ensure_series(y)
-    assert initial_train >= 10, "initial_train demasiado pequeño"
-    assert horizon >= 1, "horizon debe ser >=1"
-
-    y_true_list = []
-    y_hat_list = []
-
-    start = initial_train
-    while start + horizon <= len(y):
-        train = y.iloc[:start]
-        test_idx = y.index[start:start+horizon]
-        fc = _fit_predict_sarimax(train, steps=horizon, order=order, seasonal_order=seasonal_order, maxiter = 80)
-        y_hat_list.append(pd.Series(fc, index=test_idx))
-        y_true_list.append(y.loc[test_idx])
-        start += step
-
-    if not y_hat_list:
-        raise RuntimeError("Ventanas de backtest vacías. Ajusta initial_train/step/horizon.")
-
-    y_hat = pd.concat(y_hat_list).sort_index()
-    y_true = pd.concat(y_true_list).sort_index()
-    idx = y_true.index.intersection(y_hat.index)
-    y_true = y_true.loc[idx]; y_hat = y_hat.loc[idx]
-
-    m = metrics_regression(y_true, y_hat)
-    preds = pd.DataFrame({"y_true": y_true, "y_hat": y_hat})
-    return m, preds
+    return y_pred, best_txt
 
 
-import time
-
-def rolling_backtest_auto(
-    y: pd.Series,
-    initial_train: int = 1000,
-    step: int = 20,
-    horizon: int = 1,
-    scan_cfg: dict | None = None,
-    rescan_each_refit: bool = False,     # ← por defecto NO re-escanea cada vez
-    rescan_every_refits: int = 5         # ← si activas re-scan, hazlo cada N
-) -> tuple[dict, pd.DataFrame]:
-    y = _ensure_series(y)
-    assert initial_train >= 10 and horizon >= 1
-    scan_cfg = scan_cfg or {}
-
-    y_true_list, y_hat_list, model_used = [], [], []
-    start = initial_train
-    refit_count = 0
-    current_spec = None
-
-    total_iters = max(0, (len(y) - initial_train) // step)
-    print(f"[AUTO] ventanas={total_iters}, step={step}, horizon={horizon}")
-
-    while start + horizon <= len(y):
-        train = y.iloc[:start]
-        test_idx = y.index[start:start+horizon]
-
-        do_scan = (current_spec is None) or (rescan_each_refit and (refit_count % max(1, rescan_every_refits) == 0))
-        if do_scan:
-            current_spec = select_best_sarimax(train, scan_cfg)
-
-        t0 = time.time()
-        fc = _fit_predict_sarimax(train, steps=horizon,
-                                  order=current_spec["order"],
-                                  seasonal_order=current_spec["seasonal_order"])
-        dt = time.time() - t0
-        print(f"[AUTO] {refit_count+1:02d}/{total_iters} fin={test_idx[-1].date()} spec={current_spec['name']} t={dt:.1f}s")
-
-        y_hat_list.append(pd.Series(fc, index=test_idx))
-        y_true_list.append(y.loc[test_idx])
-        model_used.extend([current_spec["name"]] * horizon)
-
-        start += step
-        refit_count += 1
-
-    if not y_hat_list:
-        raise RuntimeError("Ventanas de backtest vacías. Ajusta initial_train/step/horizon.")
-
-    y_hat = pd.concat(y_hat_list).sort_index()
-    y_true = pd.concat(y_true_list).sort_index()
-    idx = y_true.index.intersection(y_hat.index)
-    y_true = y_true.loc[idx]; y_hat = y_hat.loc[idx]
-
-    m = metrics_regression(y_true, y_hat)
-    preds = pd.DataFrame({"y_true": y_true, "y_hat": y_hat})
-    preds["model_used"] = model_used[:len(preds)]
-    return m, preds
-
-def rolling_backtest_rw(y: pd.Series,
-                        initial_train: int = 1000,
-                        step: int = 20,
-                        horizon: int = 1) -> tuple[Dict[str,float], pd.DataFrame]:
-    """Baseline Random Walk (naive last)."""
-    y = _ensure_series(y)
-    y_true_list = []; y_hat_list = []
-    start = initial_train
-    while start + horizon <= len(y):
-        train = y.iloc[:start]
-        test_idx = y.index[start:start+horizon]
-        fc = np.array([_rw_forecast(train, horizon)] * horizon)
-        y_hat_list.append(pd.Series(fc, index=test_idx))
-        y_true_list.append(y.loc[test_idx])
-        start += step
-
-    y_hat = pd.concat(y_hat_list).sort_index()
-    y_true = pd.concat(y_true_list).sort_index()
-    idx = y_true.index.intersection(y_hat.index)
-    y_true = y_true.loc[idx]; y_hat = y_hat.loc[idx]
-    m = metrics_regression(y_true, y_hat)
-    preds = pd.DataFrame({"y_true": y_true, "y_hat": y_hat})
-    return m, preds
-
-
-def rolling_backtest_ets(y: pd.Series,
-                         initial_train: int = 1000,
-                         step: int = 20,
-                         horizon: int = 1,
-                         trend: Optional[str] = None,
-                         seasonal: Optional[str] = None,
-                         seasonal_periods: Optional[int] = None) -> tuple[Dict[str,float], pd.DataFrame]:
-    """Exponential Smoothing (si disponible)."""
-    if not _ETS_OK:
-        raise RuntimeError("ExponentialSmoothing no está disponible en este entorno.")
-    y = _ensure_series(y)
-    y_true_list = []; y_hat_list = []
-    start = initial_train
-    while start + horizon <= len(y):
-        train = y.iloc[:start]
-        test_idx = y.index[start:start+horizon]
-        model = ExponentialSmoothing(train, trend=trend, seasonal=seasonal, seasonal_periods=seasonal_periods)
-        res = model.fit(optimized=True, use_brute=True)
-        fc = res.forecast(horizon).values
-        y_hat_list.append(pd.Series(fc, index=test_idx))
-        y_true_list.append(y.loc[test_idx])
-        start += step
-
-    y_hat = pd.concat(y_hat_list).sort_index()
-    y_true = pd.concat(y_true_list).sort_index()
-    idx = y_true.index.intersection(y_hat.index)
-    y_true = y_true.loc[idx]; y_hat = y_hat.loc[idx]
-    m = metrics_regression(y_true, y_hat)
-    preds = pd.DataFrame({"y_true": y_true, "y_hat": y_hat})
-    return m, preds
-
-
-# =========================
-# Ejecutar varios modelos
-# =========================
-def evaluate_many(y: pd.Series,
-                  specs: List[Dict],
+def evaluate_many(price: pd.Series,
+                  specs: List[dict],
                   initial_train: int = 1000,
-                  step: int = 20,
-                  horizon: int = 1):
+                  step: int = 10,
+                  horizon: int = 1,
+                  target: str = "returns",
+                  pip_size: float = 0.0001,
+                  threshold_pips: float = 15.0,
+                  exog_ret: pd.Series = None,
+                  exog_lags: List[int] = None,
+                  threshold_mode: str = "fixed",
+                  atr_pips: pd.Series = None,
+                  atr_k: float = 0.6,
+                  garch_k: float = 0.6,
+                  min_threshold_pips: float = 10.0,
+                  garch_sigma_pips: pd.Series = None,
+                  log_threshold_used: bool = True,
+                  decision_cfg: Optional[dict] = None) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
-    Ejecuta backtest para múltiples 'specs'. Cada spec:
-      {'name': 'AUTO', 'kind': 'auto', 'scan': {...}, 'rescan_each_refit': True, 'rescan_every_refits': 1}
-      {'name': 'ARIMA(3,1,1)', 'kind': 'sarimax', 'order':(3,1,1), 'seasonal_order':None}
-      {'name': 'RW', 'kind': 'rw'}
-      {'name': 'ETS', 'kind': 'ets', 'trend':'add', 'seasonal':'add', 'seasonal_periods':5}
-    Devuelve (summary_df, preds_map) donde summary_df tiene métricas por modelo.
+    Walk-forward sobre specs.
+    target='returns' => y = log(price).diff()
+    decision_cfg: {"type": "pips" | "zscore", "z_thr": float}
     """
-    y = _ensure_series(y)
-    rows = []
+    price = price.astype(float).dropna()
+    y_ret = np.log(price).diff().dropna()
+    idx = price.index
+
+    X = _make_exog_lags(exog_ret, exog_lags) if exog_lags else None
+    windows = _rolling_windows_index(len(price), initial_train, step, horizon)
+    n_win = len(windows)
+    if n_win == 0:
+        raise ValueError("No hay ventanas válidas. Revisa initial_train/step/horizon y el tamaño de la serie.")
+
+    print(f"[AUTO] ventanas={n_win}, step={step}, horizon={horizon}, target={target}, thr_mode={threshold_mode}")
+
     preds_map: Dict[str, pd.DataFrame] = {}
+    summary_rows: List[Dict[str, Any]] = []
 
-    for sp in specs:
-        name = sp.get("name", sp.get("kind", "model"))
-        kind = sp.get("kind", "sarimax")
-        try:
-            if kind == "rw":
-                m, p = rolling_backtest_rw(y, initial_train=initial_train, step=step, horizon=horizon)
-            elif kind == "ets":
-                m, p = rolling_backtest_ets(
-                    y, initial_train=initial_train, step=step, horizon=horizon,
-                    trend=sp.get("trend"), seasonal=sp.get("seasonal"), seasonal_periods=sp.get("seasonal_periods")
-                )
-            elif kind == "sarimax":
-                m, p = rolling_backtest_sarimax(
-                    y, order=sp["order"], seasonal_order=sp.get("seasonal_order"),
-                    initial_train=initial_train, step=step, horizon=horizon
-                )
-            elif kind == "auto":
-                m, p = rolling_backtest_auto(
-                    y,
-                    initial_train=initial_train, step=step, horizon=horizon,
-                    scan_cfg=sp.get("scan", {}),
-                    rescan_each_refit=sp.get("rescan_each_refit", True),
-                    rescan_every_refits=sp.get("rescan_every_refits", 1)
-                )
+    for spec in specs:
+        name = spec.get("name", "MODEL")
+        t0 = time.perf_counter()
+        rows = []
+
+        for i, (s0, e_tr, e_te) in enumerate(windows, start=1):
+            date_end_train = idx[e_tr]
+            date_next = idx[e_te]
+
+            y_train = y_ret.loc[:date_end_train].dropna()
+            if X is not None:
+                exog_train = X.loc[y_train.index].dropna()
+                y_train, exog_train = y_train.align(exog_train, join="inner")
             else:
-                raise ValueError(f"kind desconocido: {kind}")
+                exog_train = None
 
-            row = {"Modelo": name}; row.update(m)
-            rows.append(row); preds_map[name] = p
-        except Exception as e:
-            row = {"Modelo": name, "ERROR": str(e)}
-            rows.append(row)
+            exog_next = X.reindex([date_next]) if X is not None else None
 
-    summary_df = pd.DataFrame(rows)
+            # Umbral en pips (fijo / ATR / GARCH) para ESTA ventana
+            thr = _resolve_threshold(
+                date_end_train,
+                threshold_mode,
+                fixed_pips=threshold_pips,
+                min_threshold_pips=min_threshold_pips,
+                atr_pips=atr_pips,
+                atr_k=atr_k,
+                garch_sigma_pips=garch_sigma_pips,
+                garch_k=garch_k
+            )
+
+            # Predicción 1-paso de retorno
+            t_fit = time.perf_counter()
+            y_pred_ret, spec_txt = _fit_and_forecast(y_train, date_next, spec, exog_train, exog_next)
+            t_elapsed = time.perf_counter() - t_fit
+
+            # Retorno real del día siguiente
+            y_true_ret = y_ret.reindex([date_next]).iloc[0]
+
+            price_t = price.loc[date_end_train]
+            price_tp1 = price.loc[date_next]
+
+            # Señal (por pips por defecto). Puedes pasar decision_cfg desde main/config.
+            y_pred_pips, signal, z_used = _decide_signal_by_rule(
+                y_pred_ret, price_t, pip_size,
+                decision_cfg=(decision_cfg or {"type": "pips"}),
+                thr_pips=thr,
+                sigma_next_pips=None  # hook para zscore con sigma en pips
+            )
+
+            # PnL en pips
+            pnl_pips = 0.0
+            if signal != 0:
+                move_pips = (price_tp1 - price_t) / pip_size
+                pnl_pips = float(signal * move_pips)
+
+            # Precio predicho
+            y_pred_price = float(price_t * math.exp(y_pred_ret))
+
+            rows.append({
+                "date": date_next,
+                "spec": spec_txt,
+                "threshold_used_pips": float(thr) if log_threshold_used else np.nan,
+                "y_true_ret": float(y_true_ret),
+                "y_pred_ret": float(y_pred_ret),
+                "y_pred_price": y_pred_price,
+                "y_pred_pips": float(y_pred_pips),
+                "signal": int(signal),
+                "pnl_pips": float(pnl_pips),
+                "price_t": float(price_t),
+                "price_t1": float(price_tp1),
+                "fit_seconds": round(t_elapsed, 1),
+            })
+
+            if i == 1 or i % 10 == 0 or i == n_win:
+                print(f"[AUTO] {i:02d}/{n_win} fin={date_end_train.date()} spec={spec_txt} thr={thr:.1f}p t={t_elapsed:.1f}s")
+
+        df_pred = pd.DataFrame(rows).set_index("date").sort_index()
+        df_pred["cum_pips"] = df_pred["pnl_pips"].cumsum()
+
+        # Métricas
+        rmse = _rmse(df_pred["y_true_ret"], df_pred["y_pred_ret"])
+        mae = _mae(df_pred["y_true_ret"], df_pred["y_pred_ret"])
+        r2 = _r2(df_pred["y_true_ret"], df_pred["y_pred_ret"])
+
+        price_err = df_pred["y_pred_price"] - df_pred["price_t1"]
+        rmse_price = float(math.sqrt((price_err ** 2).mean())) if len(price_err) else float("nan")
+        mae_price = float(price_err.abs().mean()) if len(price_err) else float("nan")
+
+        err_pips = ((df_pred["y_pred_ret"] - df_pred["y_true_ret"]) * df_pred["price_t"]) / pip_size
+        rmse_pips = float(math.sqrt((err_pips ** 2).mean())) if len(err_pips) else float("nan")
+        mae_pips = float(err_pips.abs().mean()) if len(err_pips) else float("nan")
+
+        pct_err = (price_err.abs() / df_pred["price_t1"]).replace([np.inf, -np.inf], np.nan).dropna()
+        rmse_pct = float(math.sqrt(((price_err / df_pred["price_t1"]) ** 2).mean())) * 100.0 if len(pct_err) else float("nan")
+        mae_pct = float(pct_err.mean() * 100.0) if len(pct_err) else float("nan")
+
+        trades = df_pred[df_pred["signal"] != 0]
+        n_trades = int(len(trades))
+        wins = trades[trades["pnl_pips"] > 0]
+        losses = trades[trades["pnl_pips"] < 0]
+        hitrate = float((wins.shape[0] / n_trades) * 100.0) if n_trades > 0 else 0.0
+        avg_gain = float(wins["pnl_pips"].mean()) if len(wins) else float("nan")
+        avg_loss = float(losses["pnl_pips"].mean()) if len(losses) else float("nan")
+        total_pips = float(trades["pnl_pips"].sum()) if n_trades > 0 else 0.0
+        dd = _drawdown(df_pred["cum_pips"].fillna(0.0))
+        maxdd = float(dd.min()) if len(dd) else 0.0
+        sharpe_like = float(df_pred["pnl_pips"].mean() / (df_pred["pnl_pips"].std() + 1e-12) * math.sqrt(252.0)) if df_pred["pnl_pips"].std() > 0 else float("nan")
+
+        elapsed = time.perf_counter() - t0
+        summary_rows.append({
+            "Modelo": name,
+            "RMSE": rmse, "MAE": mae, "R2": r2,
+            "RMSE_price": rmse_price, "MAE_price": mae_price,
+            "RMSE_pips": rmse_pips, "MAE_pips": mae_pips,
+            "RMSE_%": rmse_pct, "MAE_%": mae_pct,
+            "HitRate": hitrate,
+            "Total_pips": total_pips,
+            "Trades": n_trades,
+            "WinRate_%": hitrate,
+            "AvgGain_pips": avg_gain,
+            "AvgLoss_pips": avg_loss,
+            "MaxDD_pips": maxdd,
+            "Sharpe_like": sharpe_like,
+            "elapsed_s": round(elapsed, 1)
+        })
+
+        preds_map[name] = df_pred
+
+    summary_df = pd.DataFrame(summary_rows)
     return summary_df, preds_map
 
+
 # =========================
-# Guardado a Excel (safe sheet names)
+# Export / Plots
 # =========================
-import re
-
-def _sanitize_sheet_name(name: str, taken: set[str]) -> str:
-    """
-    Hace válido un nombre de hoja de Excel:
-    - Reemplaza caracteres inválidos []:*?/\
-    - Recorta a 31 caracteres
-    - Evita duplicados añadiendo sufijos (2), (3)...
-    """
-    if name is None or str(name).strip() == "":
-        name = "Sheet"
-    s = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(name))  # reemplaza caracteres prohibidos
-    s = s.strip()
-    if len(s) > 31:
-        s = s[:31]
-    base = s
-    i = 2
-    while s in taken:
-        suf = f" ({i})"
-        s = (base[: max(0, 31 - len(suf))] + suf) if len(base) + len(suf) > 31 else base + suf
-        i += 1
-    taken.add(s)
-    return s
-
-def save_backtest_excel(path: str,
-                        summary_df,
-                        preds_map: Dict[str, pd.DataFrame]) -> None:
-    """
-    Guarda resultados en un Excel. 'summary_df' puede ser DataFrame o dict name->metrics.
-    Nombres de hoja saneados para cumplir restricciones de Excel.
-    """
-    if isinstance(summary_df, dict):
-        rows = []
-        for name, m in summary_df.items():
-            row = {"Modelo": name}; row.update(m)
-            rows.append(row)
-        summary_df = pd.DataFrame(rows)
-
-    # Motor preferido
+def save_backtest_excel(outxlsx: str,
+                        summary: pd.DataFrame,
+                        preds_map: Dict[str, pd.DataFrame]):
+    _safe_mkdir(os.path.dirname(outxlsx) or ".")
     try:
         import xlsxwriter  # noqa
-        writer_kwargs = {"engine": "xlsxwriter", "datetime_format": "yyyy-mm-dd hh:mm"}
+        engine = "xlsxwriter"
     except Exception:
-        writer_kwargs = {"engine": "openpyxl"}
+        engine = "openpyxl"
 
-    import os
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with pd.ExcelWriter(outxlsx, engine=engine) as w:
+        summary.round(6).to_excel(w, sheet_name="Summary", index=False)
+        for name, df in preds_map.items():
+            sheet = _sheet_name_safe(name)
+            tmp = df.copy()
+            # redondeos amigables
+            for c in ("y_true_ret", "y_pred_ret"):
+                if c in tmp.columns:
+                    tmp[c] = tmp[c].round(6)
+            for c in ("y_pred_price", "price_t", "price_t1"):
+                if c in tmp.columns:
+                    tmp[c] = tmp[c].round(6)
+            for c in ("y_pred_pips", "threshold_used_pips", "pnl_pips", "cum_pips"):
+                if c in tmp.columns:
+                    tmp[c] = tmp[c].round(3)
+            tmp.to_excel(w, sheet_name=sheet)
 
-    taken: set[str] = set()
-    with pd.ExcelWriter(path, **writer_kwargs) as w:
-        resumen_name = _sanitize_sheet_name("Resumen", taken)
-        summary_df.to_excel(w, sheet_name=resumen_name, index=False)
 
-        for name, dfp in preds_map.items():
-            safe = _sanitize_sheet_name(name, taken)
-            tmp = dfp.copy()
-            if isinstance(tmp.index, pd.DatetimeIndex):
-                try:
-                    tmp.index = tmp.index.tz_localize(None)
-                except Exception:
-                    pass
-            tmp.to_excel(w, sheet_name=safe)
+def save_backtest_plots(outdir: str,
+                        y_price: pd.Series,
+                        preds_map: Dict[str, pd.DataFrame],
+                        pip_size: float,
+                        threshold_pips: float):
+    """
+    4 gráficos por modelo: (retornos, pips, precio, equity)
+    """
+    _safe_mkdir(outdir)
 
-    print(f"💾 Backtest guardado en: {path}")
+    for name, df in preds_map.items():
+        nm = _file_name_safe(name)
+        d = df.copy().sort_index()
+
+        if {"threshold_used_pips", "price_t"}.issubset(d.columns):
+            # pips -> retorno equivalente: thr_ret = thr_pips * (pip_size / price_t)
+            d["thr_ret"] = (d["threshold_used_pips"] * (pip_size / d["price_t"]))
+        else:
+            d["thr_ret"] = np.nan
+
+        # 1) Retornos
+        fig, ax = plt.subplots(figsize=(11, 4))
+        if "y_true_ret" in d and "y_pred_ret" in d:
+            ax.plot(d.index, d["y_true_ret"], label="Ret. real", linewidth=1.2)
+            ax.plot(d.index, d["y_pred_ret"], label="Ret. pred", linewidth=1.0, alpha=0.9)
+        if d["thr_ret"].notna().any():
+            ax.plot(d.index, d["thr_ret"], linestyle="--", linewidth=1.0, label="+Umbral (ret equiv.)")
+            ax.plot(d.index, -d["thr_ret"], linestyle="--", linewidth=1.0, label="-Umbral (ret equiv.)")
+
+        if "signal" in d and "y_true_ret" in d:
+            buys = d[d["signal"] == 1]
+            sells = d[d["signal"] == -1]
+            if not buys.empty:
+                ax.scatter(buys.index, buys["y_true_ret"], marker="^", s=40, label="Buy signal", zorder=3)
+            if not sells.empty:
+                ax.scatter(sells.index, sells["y_true_ret"], marker="v", s=40, label="Sell signal", zorder=3)
+
+        ax.set_title(f"{name} · Retornos (true vs pred) + umbral")
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{nm}_ret_line.png"))
+        plt.close(fig)
+
+        # 2) Predicción en pips vs umbral
+        fig, ax = plt.subplots(figsize=(11, 4))
+        if "y_pred_pips" in d:
+            ax.plot(d.index, d["y_pred_pips"], label="Predicción (pips)", linewidth=1.2)
+        if "threshold_used_pips" in d:
+            ax.plot(d.index, d["threshold_used_pips"], linestyle="--", linewidth=1.0, label="+Umbral (pips)")
+            ax.plot(d.index, -d["threshold_used_pips"], linestyle="--", linewidth=1.0, label="-Umbral (pips)")
+
+        if "signal" in d and "y_pred_pips" in d:
+            trades_idx = d.index[d["signal"] != 0]
+            if len(trades_idx):
+                colors = np.where(d.loc[trades_idx, "signal"] > 0, "g", "r")
+                ax.scatter(trades_idx, d.loc[trades_idx, "y_pred_pips"], c=colors, s=25, label="Señales")
+
+        ax.set_title(f"{name} · Predicción en pips vs umbral")
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, f"{nm}_pips_vs_threshold.png"))
+        plt.close(fig)
+
+        # 3) Precio real vs predicho
+        if {"price_t1", "y_pred_price"}.issubset(d.columns):
+            fig, ax = plt.subplots(figsize=(11, 4))
+            ax.plot(d.index, d["price_t1"], label="Precio real (t+1)", linewidth=1.2)
+            ax.plot(d.index, d["y_pred_price"], label="Precio predicho", linewidth=1.0, alpha=0.9)
+
+            if "signal" in d:
+                buys = d[d["signal"] == 1]
+                sells = d[d["signal"] == -1]
+                if not buys.empty:
+                    ax.scatter(buys.index, buys["price_t1"], marker="^", s=40, label="Buy", zorder=3)
+                if not sells.empty:
+                    ax.scatter(sells.index, sells["price_t1"], marker="v", s=40, label="Sell", zorder=3)
+
+            ax.set_title(f"{name} · Precio real vs precio predicho")
+            ax.legend(loc="best")
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, f"{nm}_price_line.png"))
+            plt.close(fig)
+
+        # 4) Equity curve
+        if "cum_pips" in d.columns:
+            fig, ax = plt.subplots(figsize=(11, 4))
+            ax.plot(d.index, d["cum_pips"], linewidth=1.2)
+            ax.set_title(f"{name} · PnL acumulado (pips)")
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, f"{nm}_equity.png"))
+            plt.close(fig)
