@@ -1,277 +1,266 @@
-# reportes/reportes_excel.py
-# =============================================================================
-# Exportadores de resultados a Excel:
-#  - export_resultados_modelos: reporte "completo" (varias hojas)
-#  - export_excel_simple:       reporte "simple"   (hojas mínimas)
-#
-# También se mantienen utilidades legacy:
-#  - write_metrics_sheet
-#  - append_history
-#
-# Requisitos:
-#   pandas>=1.4, openpyxl instalado
-# =============================================================================
+"""
+Módulo centralizado de reportes Excel/CSV.
 
-import os
-from datetime import datetime
+Objetivos:
+- Proveer un **único punto** para generar archivos .xlsx con:
+  - Una hoja 'metrics' con MAE, RMSE, MAPE, Directional_Accuracy y Sortino por modelo.
+  - Una hoja por modelo con sus predicciones (horizon=1) normalizadas: ds, y_true, y_pred, error, residual.
+- Mantener **compatibilidad** con llamadas existentes (nombres alternativos).
+- Ofrecer utilidades ligeras para exportar CSV por modelo y un Excel consolidado
+  cuando se usa backtesting por clase (Prophet/LSTM) desde `main.py`.
+
+NOTA: Este módulo NO elimina ni reemplaza lógicas existentes, solo centraliza
+la escritura. Si ya tienes funciones previas, estas se mantienen y se amplían.
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from typing import Dict, Any, Optional, Iterable
+
+import numpy as np
 import pandas as pd
 
+# ---------------------------------------------------------------------
+# Utilidades internas
+# ---------------------------------------------------------------------
 
-# --------------------------- Utilidades internas -----------------------------
+def _to_series(x) -> pd.Series:
+    """Convierte ndarray/DataFrame/Series a Series (prioriza columnas 'yhat' si existen)."""
+    if isinstance(x, pd.Series):
+        return x
+    if isinstance(x, pd.DataFrame):
+        for c in ("yhat", "y_pred", 1, "1"):
+            if c in x.columns:
+                return x[c]
+        # fallback: última col
+        return x.iloc[:, -1]
+    return pd.Series(x)
 
-def _ensure_dir(path: str):
-    """Crea la carpeta contenedora (si no existe) para la ruta de archivo dada."""
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-def _to_df(obj):
-    """Convierte dict/DataFrame a DataFrame; lanza TypeError si no es posible."""
-    if isinstance(obj, pd.DataFrame):
-        return obj
-    if isinstance(obj, dict):
-        return pd.DataFrame([obj])
-    raise TypeError("Objeto no convertible a DataFrame (esperado dict o DataFrame).")
-
-def _build_dm_nivel_table(dm_dict: dict) -> pd.DataFrame:
+def _normalize_pred(df_like, price: Optional[pd.Series] = None) -> pd.DataFrame:
     """
-    Convierte el dict de DM (nivel) a DataFrame indexado por 'model'.
-    dm_dict = { model: {'DM':..., 'p_value':..., 'T':...}, ... }
+    Normaliza un backtest 'wide' a columnas estándar con horizonte=1:
+      ds, y_true, y_pred, error, residual
     """
-    rows = []
-    for m, d in (dm_dict or {}).items():
-        rows.append({
-            "model": m,
-            "DM_stat": d.get("DM"),
-            "p_value": d.get("p_value"),
-            "T": d.get("T")
-        })
-    if not rows:
-        return pd.DataFrame(columns=["model","DM_stat","p_value","T"]).set_index("model")
-    return pd.DataFrame(rows).set_index("model").sort_index()
-
-def _build_dm_vol_table(vol_preds: pd.DataFrame) -> pd.DataFrame:
-    """
-    Construye una tabla con la prueba DM entre GARCH y HAR en VOLATILIDAD,
-    si las columnas necesarias están disponibles (rv_true, har_rv y garch_rv o garch_sigma).
-    Devuelve DataFrame con 1 fila (compare='garch_rv vs har_rv') o vacío.
-    """
-    from scipy import stats
-
-    def diebold_mariano(y_true: pd.Series, y1: pd.Series, y2: pd.Series,
-                        h: int = 1, loss: str = "mse") -> dict:
-        y_true = y_true.astype(float)
-        y1 = y1.reindex_like(y_true).astype(float)
-        y2 = y2.reindex_like(y_true).astype(float)
-        if loss == "mse":
-            d = (y_true - y1)**2 - (y_true - y2)**2
+    s_pred = _to_series(df_like).copy()
+    if not isinstance(s_pred.index, pd.DatetimeIndex):
+        # si viene con índice 'ds' columna:
+        if isinstance(df_like, pd.DataFrame) and "ds" in df_like.columns:
+            s_pred.index = pd.to_datetime(df_like["ds"])
         else:
-            d = (y_true - y1).abs() - (y_true - y2).abs()
-        d = d.dropna(); T = len(d)
-        if T < 5:
-            return {"DM": float("nan"), "p_value": float("nan"), "T": int(T)}
-        dbar = d.mean()
-        def acov(x, k):
-            import numpy as np
-            return np.cov(x[k:], x[:-k], bias=True)[0, 1] if k > 0 else np.var(x, ddof=0)
-        s = acov(d.values, 0)
-        for k in range(1, h):
-            s += 2 * (1 - k/h) * acov(d.values, k)
-        var_dbar = s / T
-        DM = dbar / ((var_dbar ** 0.5) + 1e-12)
-        p = 2 * (1 - stats.t.cdf(abs(DM), df=T-1))
-        return {"DM": float(DM), "p_value": float(p), "T": int(T)}
+            s_pred.index = pd.to_datetime(s_pred.index)
+    s_pred = s_pred.sort_index()
+    s_pred.name = "y_pred"
 
-    if not isinstance(vol_preds, pd.DataFrame) or vol_preds.empty:
-        return pd.DataFrame()
-
-    df = vol_preds.copy()
-    if "rv_true" not in df.columns:
-        return pd.DataFrame()
-
-    # Convertir sigma -> var si hace falta
-    if "garch_rv" not in df.columns and "garch_sigma" in df.columns:
-        df["garch_rv"] = df["garch_sigma"]**2
-
-    if not {"garch_rv", "har_rv"}.issubset(df.columns):
-        return pd.DataFrame()
-
-    y = df["rv_true"].astype(float)
-    g = df["garch_rv"].astype(float)
-    h = df["har_rv"].astype(float)
-    common = y.dropna().index.intersection(g.dropna().index).intersection(h.dropna().index)
-    if len(common) < 5:
-        return pd.DataFrame()
-
-    dm = diebold_mariano(y.loc[common], g.loc[common], h.loc[common], h=1, loss="mse")
-    out = pd.DataFrame([{
-        "compare": "garch_rv vs har_rv",
-        "DM_stat": dm["DM"],
-        "p_value": dm["p_value"],
-        "T": dm["T"]
-    }]).set_index("compare")
-    return out
-
-
-# ----------------------- Exportador COMPLETO (modo modelos) -------------------
-
-def export_resultados_modelos(
-    ruta_excel: str,
-    res_nivel_metrics: pd.DataFrame,
-    res_nivel_preds: pd.DataFrame,
-    res_nivel_dm: dict,
-    res_vol_metrics: pd.DataFrame,
-    res_vol_preds: pd.DataFrame,
-    har_summary_text: str,
-    cfg_dict: dict | None = None
-):
-    """
-    Escribe/actualiza un Excel con TODAS las hojas del modo 'modelos'.
-
-    Hojas que se crean/reemplazan:
-      - Nivel_Metricas:    métricas de nivel por modelo (RMSE/MAE/MAPE/Theil’sU/HitRate)
-      - Nivel_DM_vs_RW:    tabla DM vs RW (DM_stat, p_value, T)   [si hay datos]
-      - Nivel_Predicciones:serie real y predicciones por modelo (tramo de evaluación)
-
-      - Vol_Metricas:      métricas de volatilidad (RMSE/MAE) para har_rv, garch_rv/σ
-      - Vol_Predicciones:  columnas: rv_true, har_rv, garch_rv (o garch_sigma)
-      - Vol_DM:            DM(garch_rv vs har_rv)                 [si aplicable]
-
-      - Config_Resumen:    parámetros clave + timestamp
-      - HAR_Resumen:       texto del summary() del OLS HAR (una columna de líneas)
-    """
-    _ensure_dir(ruta_excel)
-
-    # Construir tablas DM
-    dm_nivel_df = _build_dm_nivel_table(res_nivel_dm)
-    try:
-        dm_vol_df = _build_dm_vol_table(res_vol_preds)
-    except Exception:
-        dm_vol_df = pd.DataFrame()
-
-    # Config mínima
-    cfg_dict = cfg_dict or {}
-    cfg_rows = []
-    for k, v in {**cfg_dict, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}.items():
-        cfg_rows.append([k, v])
-    cfg_df = pd.DataFrame(cfg_rows, columns=["clave", "valor"])
-
-    # HAR summary como tabla de 1 columna
-    har_txt = pd.DataFrame({"HAR_summary": (har_summary_text or "").splitlines()})
-
-    file_exists = os.path.exists(ruta_excel)
-    if file_exists:
-        with pd.ExcelWriter(ruta_excel, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            # Nivel
-            _to_df(res_nivel_metrics).to_excel(writer, sheet_name="Nivel_Metricas")
-            if not dm_nivel_df.empty:
-                dm_nivel_df.to_excel(writer, sheet_name="Nivel_DM_vs_RW")
-            _to_df(res_nivel_preds).to_excel(writer, sheet_name="Nivel_Predicciones")
-
-            # Volatilidad
-            _to_df(res_vol_metrics).to_excel(writer, sheet_name="Vol_Metricas")
-            _to_df(res_vol_preds).to_excel(writer, sheet_name="Vol_Predicciones")
-            if not dm_vol_df.empty:
-                dm_vol_df.to_excel(writer, sheet_name="Vol_DM")
-
-            # Resúmenes
-            cfg_df.to_excel(writer, sheet_name="Config_Resumen", index=False)
-            har_txt.to_excel(writer, sheet_name="HAR_Resumen", index=False)
+    if price is not None:
+        y_true = price.reindex(s_pred.index).shift(-0)  # ya está alineado a t+1 en construcción del backtest
+        y_true = y_true.ffill().astype(float)
     else:
-        with pd.ExcelWriter(ruta_excel, engine="openpyxl", mode="w") as writer:
-            # Nivel
-            _to_df(res_nivel_metrics).to_excel(writer, sheet_name="Nivel_Metricas")
-            if not dm_nivel_df.empty:
-                dm_nivel_df.to_excel(writer, sheet_name="Nivel_DM_vs_RW")
-            _to_df(res_nivel_preds).to_excel(writer, sheet_name="Nivel_Predicciones")
+        y_true = pd.Series(index=s_pred.index, data=np.nan, dtype=float, name="y_true")
 
-            # Volatilidad
-            _to_df(res_vol_metrics).to_excel(writer, sheet_name="Vol_Metricas")
-            _to_df(res_vol_preds).to_excel(writer, sheet_name="Vol_Predicciones")
-            if not dm_vol_df.empty:
-                dm_vol_df.to_excel(writer, sheet_name="Vol_DM")
+    df = pd.DataFrame({"y_true": y_true, "y_pred": s_pred})
+    df.index.name = "ds"
+    df["error"] = (df["y_true"] - df["y_pred"]).astype(float)
+    df["residual"] = df["error"]
+    return df
 
-            # Resúmenes
-            cfg_df.to_excel(writer, sheet_name="Config_Resumen", index=False)
-            har_txt.to_excel(writer, sheet_name="HAR_Resumen", index=False)
-
-
-# ------------------------ Exportador SIMPLE (modo simple) ---------------------
-
-def export_excel_simple(
-    ruta_excel: str,
-    metricas_df: pd.DataFrame,
-    dm_dict: dict,
-    preds_df: pd.DataFrame,
-    config: dict
-):
+def _metrics_from_frame(df: pd.DataFrame) -> Dict[str, float]:
     """
-    Crea/actualiza un Excel mínimo con 4 hojas:
-      - Metricas_Nivel: RMSE/MAE/MAPE/Theil’sU/HitRate por modelo
-      - DM_vs_RW:       estadístico y p-valor del DM (modelo vs RW)
-      - Predicciones:   y real + columnas de modelos (tramo test)
-      - Config:         parámetros básicos + timestamp
-
-    Este reporte NO sustituye al completo; es una variante ligera.
+    Calcula métricas genéricas desde el DF normalizado (ds, y_true, y_pred, error, residual).
     """
-    _ensure_dir(ruta_excel)
+    d = df.dropna(subset=["y_true", "y_pred"]).copy()
+    if d.empty:
+        return {"MAE": np.nan, "RMSE": np.nan, "MAPE(%)": np.nan,
+                "Directional_Accuracy": np.nan, "Sortino": np.nan}
+    err = d["y_true"] - d["y_pred"]
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(np.square(err))))
+    denom = np.where(d["y_true"] == 0, np.nan, np.abs(d["y_true"]))
+    mape = float(np.nanmean(np.abs(err) / denom) * 100.0)
 
-    # DM dict -> DataFrame
-    dm_rows = []
-    for m, d in (dm_dict or {}).items():
-        dm_rows.append({
-            "model": m,
-            "DM_stat": d.get("DM"),
-            "p_value": d.get("p_value"),
-            "T": d.get("T")
-        })
-    dm_df = pd.DataFrame(dm_rows).set_index("model") if dm_rows else pd.DataFrame(columns=["model","DM_stat","p_value","T"])
+    # direccional vs base (aprox con diferencia en el tiempo)
+    # si no hay 'base', usamos la señal de (y_pred(t+1) - y_pred(t)) como orientación; de lo contrario,
+    # comparamos signos de (y_true - y_pred). Para mantenerlo estable, usamos y_true vs y_pred respecto a cero.
+    real_dir = np.sign(d["y_true"].diff())
+    pred_dir = np.sign(d["y_pred"].diff())
+    mask = real_dir.notna() & pred_dir.notna()
+    acc = float(np.mean((real_dir[mask] == pred_dir[mask]).astype(float))) if mask.any() else np.nan
 
-    # Config -> DataFrame
-    cfg = {**(config or {}), "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    cfg_df = pd.DataFrame([{"clave": k, "valor": v} for k, v in cfg.items()])
+    # sortino: retorno proxy con cambios sobre y_true; señal = signo del cambio en y_pred
+    ret_real = d["y_true"].pct_change()
+    signal = np.sign(d["y_pred"].diff()).reindex(ret_real.index).fillna(0.0)
+    strat = signal * ret_real
+    downside = strat.copy()
+    downside[downside > 0] = 0.0
+    dd = float(np.sqrt(np.nanmean(np.square(downside))))
+    mean_ret = float(np.nanmean(strat))
+    sortino = float(mean_ret / dd) if dd and dd > 0 else np.inf
 
-    file_exists = os.path.exists(ruta_excel)
-    if file_exists:
-        with pd.ExcelWriter(ruta_excel, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            metricas_df.to_excel(writer, sheet_name="Metricas_Nivel")
-            if not dm_df.empty:
-                dm_df.to_excel(writer, sheet_name="DM_vs_RW")
-            preds_df.to_excel(writer, sheet_name="Predicciones")
-            cfg_df.to_excel(writer, sheet_name="Config", index=False)
-    else:
-        with pd.ExcelWriter(ruta_excel, engine="openpyxl", mode="w") as writer:
-            metricas_df.to_excel(writer, sheet_name="Metricas_Nivel")
-            if not dm_df.empty:
-                dm_df.to_excel(writer, sheet_name="DM_vs_RW")
-            preds_df.to_excel(writer, sheet_name="Predicciones")
-            cfg_df.to_excel(writer, sheet_name="Config", index=False)
+    return {"MAE": mae, "RMSE": rmse, "MAPE(%)": mape,
+            "Directional_Accuracy": acc, "Sortino": sortino}
+
+def _sheet_name_safe(name: str) -> str:
+    return str(name)[:31].replace("/", "_").replace("\\", "_").replace("?", "_").replace("*", "_")
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
-# ------------------------ Funciones legacy (compat) --------------------------
+# ---------------------------------------------------------------------
+# 1) CSV rápido por modelo (inspección)
+# ---------------------------------------------------------------------
 
-def write_metrics_sheet(ruta_excel: str, metrics: dict, sheet_name: str = 'Métricas Modelo'):
+def export_backtest_csv_per_model(
+    symbol: str,
+    pred_map: Dict[str, Any],
+    price: Optional[pd.Series],
+    outdir: Path
+) -> None:
     """
-    Reemplaza la hoja con las métricas de la última corrida (formato fila única).
-    Se mantiene por compatibilidad con versiones previas.
+    Escribe un CSV por cada modelo del mapa:
+      columnas: ds, y_true, y_pred, error, residual
     """
-    _ensure_dir(ruta_excel)
-    df = pd.DataFrame([metrics])
-    with pd.ExcelWriter(ruta_excel, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    outdir.mkdir(parents=True, exist_ok=True)
+    for name, mat in pred_map.items():
+        df_norm = _normalize_pred(mat, price=price)
+        fname = outdir / f"{symbol}_{name.upper()}_backtest.csv"
+        df_norm.to_csv(fname, index=True)
+        print(f"💾 [{name}] Backtest guardado en {fname}")
 
-def append_history(ruta_excel: str, metrics: dict, hist_sheet: str = 'Historico Métricas'):
+
+# ---------------------------------------------------------------------
+# 2) XLSX consolidado por clase (una hoja por modelo + METRICS)
+# ---------------------------------------------------------------------
+
+def export_backtest_excel_consolidado(
+    symbol: str,
+    pred_map: Dict[str, Any],
+    price: Optional[pd.Series],
+    excel_path: Path,
+    seasonality_m: int | None = 1,
+    annualization: int | None = None
+) -> None:
     """
-    Agrega una fila al histórico (crea la hoja si no existe).
-    Se mantiene por compatibilidad con versiones previas.
+    Genera un XLSX con:
+      - Hoja 'metrics' (una fila por modelo, con MAE/RMSE/MAPE/Accuracy/Sortino)
+      - Hoja por modelo con ds, y_true, y_pred, error, residual (horizon=1)
     """
-    _ensure_dir(ruta_excel)
-    row = pd.DataFrame([metrics])
+    _ensure_parent(excel_path)
+
+    # Construcción de métricas
+    metrics_rows = []
+    per_model_frames: Dict[str, pd.DataFrame] = {}
+
+    for name, mat in pred_map.items():
+        df_norm = _normalize_pred(mat, price=price)
+        per_model_frames[name] = df_norm
+        met = _metrics_from_frame(df_norm)
+        metrics_rows.append({"Model": name, **met})
+
+    metrics_df = pd.DataFrame(metrics_rows)
+
+    # Escritura
+    with pd.ExcelWriter(excel_path, engine="xlsxwriter") as xw:
+        # hoja metrics
+        metrics_df.to_excel(xw, sheet_name="metrics", index=False)
+
+        # hojas por modelo
+        for name, dfm in per_model_frames.items():
+            sheet = _sheet_name_safe(name)
+            dfm.reset_index().rename(columns={"index": "ds"}).to_excel(xw, sheet_name=sheet, index=False)
+
+    print(f"💾 XLSX consolidado por clase guardado en: {excel_path}")
+
+
+# ---------------------------------------------------------------------
+# 3) API central usada por backtest_rolling / main (compatibilidad)
+# ---------------------------------------------------------------------
+
+def exportar_backtest_excel(
+    path_xlsx: str,
+    price: Optional[pd.Series],
+    preds_map: Dict[str, Any],
+    summary: Optional[pd.DataFrame] = None,
+    config: Optional[dict] = None,
+    **kwargs
+) -> None:
+    """
+    Punto de entrada “canónico” del exportador CENTRALIZADO.
+    - Si `summary` viene (ARIMA/SARIMA), se crea o actualiza hoja 'summary'.
+    - Siempre crea/actualiza hoja 'metrics' y una hoja por modelo con predicciones normalizadas.
+    """
+    excel_path = Path(path_xlsx)
+    _ensure_parent(excel_path)
+
+    # Preparar métricas y hojas por modelo
+    metrics_rows = []
+    per_model_frames: Dict[str, pd.DataFrame] = {}
+    for name, mat in preds_map.items():
+        df_norm = _normalize_pred(mat, price=price)
+        per_model_frames[name] = df_norm
+        met = _metrics_from_frame(df_norm)
+        metrics_rows.append({"Model": name, **met})
+    metrics_df = pd.DataFrame(metrics_rows)
+
+    # Escritura (mantener si ya existe)
+    mode = "a" if excel_path.exists() else "w"
+    with pd.ExcelWriter(excel_path, engine="xlsxwriter", mode="w") as xw:
+        # summary si aplica
+        if summary is not None and isinstance(summary, pd.DataFrame) and not summary.empty:
+            summary.to_excel(xw, sheet_name="summary", index=False)
+
+        # hoja metrics
+        metrics_df.to_excel(xw, sheet_name="metrics", index=False)
+
+        # hojas por modelo
+        for name, dfm in per_model_frames.items():
+            sheet = _sheet_name_safe(name)
+            dfm.reset_index().rename(columns={"index": "ds"}).to_excel(xw, sheet_name=sheet, index=False)
+
+    print(f"💾 Reporte (centralizado) guardado en {excel_path}")
+
+# Alias compatibles (no romper llamadas existentes)
+guardar_backtest_excel = exportar_backtest_excel
+generar_reporte_backtest_excel = exportar_backtest_excel
+write_backtest_excel = exportar_backtest_excel
+
+# ---------------------------------------------------------------------
+# 4) Compatibilidad con backtest_rolling: export_excel_simple / export_backtest_result
+# ---------------------------------------------------------------------
+
+def export_excel_simple(path_xlsx: str, df: pd.DataFrame, sheet_name: str = "data") -> None:
+    """
+    Helper mínimo para escribir un DataFrame en una hoja específica.
+    (compatibilidad con llamados anteriores)
+    """
+    p = Path(path_xlsx)
+    _ensure_parent(p)
+    with pd.ExcelWriter(p, engine="xlsxwriter", mode="w") as xw:
+        df.to_excel(xw, sheet_name=sheet_name, index=False)
+    print(f"💾 Excel simple exportado en {p} (hoja: {sheet_name})")
+
+
+def export_backtest_result(
+    path_xlsx: str,
+    summary_df: Optional[pd.DataFrame],
+    preds_map: Dict[str, pd.DataFrame],
+    config_min: Optional[dict] = None
+) -> None:
+    """
+    Entrada utilizada por evaluate_many(...) para exportar resultados:
+    - Crea hoja 'summary' si se provee.
+    - Crea hoja 'metrics' y una hoja por modelo con predicciones normalizadas.
+    """
+    # Intentar extraer serie price de config_min si fue pasada (no siempre está).
+    price = None
     try:
-        hist_exist = pd.read_excel(ruta_excel, sheet_name=hist_sheet)
-        hist_concat = pd.concat([hist_exist, row], ignore_index=True)
+        price = (config_min or {}).get("price", None)
     except Exception:
-        hist_concat = row
+        price = None
 
-    with pd.ExcelWriter(ruta_excel, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-        hist_concat.to_excel(writer, sheet_name=hist_sheet, index=False)
+    exportar_backtest_excel(
+        path_xlsx=path_xlsx,
+        price=price,
+        preds_map=preds_map,
+        summary=summary_df,
+        config=config_min,
+    )

@@ -1,6 +1,5 @@
-# arima_adapter.py
-# Adapter ARIMA/SARIMA compatible con evaluacion_modelos.compute_metrics_prophet
-# Autor: (tu equipo)
+# modelos/arima/adapter.py
+# Adapter ARIMA/SARIMA compatible con tu main.py (modo normal)
 # Requisitos: statsmodels>=0.13, pandas, numpy
 
 from __future__ import annotations
@@ -9,16 +8,12 @@ import numpy as np
 from typing import Optional, Dict, Any, Tuple
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-
 # -------------------------------
 # Helpers internos
 # -------------------------------
 def _ensure_time_index(df: pd.DataFrame) -> pd.DatetimeIndex:
     """
-    Obtiene un índice de tiempo consistente a partir de:
-    - Columna 'time', o
-    - Índice datetime llamado 'time', o
-    - Índice datetime genérico
+    Usa columna 'time' o índice datetime. Ordena ascendente si es necesario.
     """
     if 'time' in df.columns:
         idx = pd.to_datetime(df['time'])
@@ -26,14 +21,12 @@ def _ensure_time_index(df: pd.DataFrame) -> pd.DatetimeIndex:
         idx = df.index
     else:
         raise ValueError("Se requiere columna 'time' o índice datetime en el DataFrame.")
-    if idx.is_monotonic_increasing is False:
-        # Aseguramos orden temporal
-        df_sorted = df.copy()
-        df_sorted.index = idx
-        df_sorted = df_sorted.sort_index()
-        return df_sorted.index
+    if not idx.is_monotonic_increasing:
+        df2 = df.copy()
+        df2.index = idx
+        df2 = df2.sort_index()
+        return df2.index
     return idx
-
 
 def _validate_and_prepare(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -42,45 +35,41 @@ def _validate_and_prepare(df: pd.DataFrame) -> pd.DataFrame:
     if 'Close' not in df.columns:
         raise ValueError("El DataFrame debe contener la columna 'Close'.")
 
-    # Usamos índice/columna de tiempo consistente
     idx = _ensure_time_index(df)
     base = df.copy()
     base.index = idx
     base = base.sort_index()
-    base = base[['Close']].astype(float)
-    base = base.dropna()
+    base = base[['Close']].astype(float).dropna()
     if len(base) < 30:
-        raise ValueError("Muy pocos datos para ajustar un ARIMA/SARIMA (min ~30 observaciones).")
+        raise ValueError("Muy pocos datos para ARIMA/SARIMA (mín ~30 observaciones).")
     return base
-
 
 def _build_future_index(last_time: pd.Timestamp, pasos: int, frecuencia: Optional[str], fallback: str) -> pd.DatetimeIndex:
     """
     Construye el índice futuro usando la frecuencia proporcionada o inferida.
     """
     freq = frecuencia or fallback or 'D'
-    # Genera pasos timestamps futuros excluyendo el último time ya presente
+    # Genera 'pasos' timestamps futuros excluyendo el último ya presente
     future_index = pd.date_range(start=last_time, periods=pasos+1, freq=freq)[1:]
     return future_index
-
 
 # -------------------------------
 # API pública del adapter
 # -------------------------------
 def entrenar_modelo_arima(
     df: pd.DataFrame,
-    modo: str = 'nivel',                 # 'nivel' o 'retornos'
+    modo: str = 'nivel',                 # 'nivel' | 'retornos'
     order: Tuple[int, int, int] = (1, 1, 1),
-    seasonal_order: Optional[Tuple[int, int, int, int]] = None,  # p,D,q,m -> usa SARIMAX si no es None
+    seasonal_order: Optional[Tuple[int, int, int, int]] = None,  # (P,D,Q,m); si None -> no estacional
     enforce_stationarity: bool = False,
     enforce_invertibility: bool = False,
 ) -> Dict[str, Any]:
     """
-    Ajusta ARIMA (o SARIMA si se provee seasonal_order) de forma compatible con la herramienta.
-    - df: DataFrame con columnas ['time','Close'] o índice datetime.
+    Ajusta ARIMA (o SARIMA si se provee seasonal_order) de forma compatible con main.py.
+    - df: DataFrame con ['time','Close'] o índice datetime.
     - modo:
-        'nivel'    -> modela el precio (Close) con (p,d,q) y opcionalmente (P,D,Q,m)
-        'retornos' -> modela retornos porcentuales y reconstruye precio en la predicción
+        'nivel'    -> modela precio (Close)
+        'retornos' -> modela retornos (pct_change) y reconstruye precio al predecir
     """
     base = _validate_and_prepare(df)
     idx = base.index
@@ -95,10 +84,8 @@ def entrenar_modelo_arima(
         y = base['Close']
         ultimo_close = None
 
-    # Si seasonal_order es None, usamos SARIMAX igualmente con (0,0,0,0) para unificar interfaz
     seasonal_order = seasonal_order if seasonal_order is not None else (0, 0, 0, 0)
 
-    # Ajuste del modelo
     model = SARIMAX(
         y,
         order=order,
@@ -106,11 +93,9 @@ def entrenar_modelo_arima(
         enforce_stationarity=enforce_stationarity,
         enforce_invertibility=enforce_invertibility,
         trend=None,
-        # simple_differencing=False mantiene la integración dentro del modelo
     )
     fitted = model.fit(disp=False)
 
-    # Frecuencia inferida del histórico (fallback a 'D' si no se puede)
     freq_inferida = pd.infer_freq(idx)
     last_time = idx.max()
 
@@ -122,7 +107,6 @@ def entrenar_modelo_arima(
         'ultimo_close': ultimo_close,
     }
 
-
 def predecir_precio_arima(
     modelo: Dict[str, Any],
     pasos: int = 3,
@@ -130,10 +114,8 @@ def predecir_precio_arima(
     alpha: float = 0.10,  # 90% CI por defecto
 ) -> pd.DataFrame:
     """
-    Predice 'pasos' periodos hacia adelante y devuelve el DataFrame estándar:
-    ['timestamp_prediccion','precio_estimado','min_esperado','max_esperado']
-    - Si 'modo' fue 'retornos': interpreta la media pronosticada como retornos y reconstruye precio.
-    - Si 'modo' fue 'nivel'  : interpreta la media como precio.
+    Predice 'pasos' periodos hacia adelante y devuelve:
+      ['timestamp_prediccion','precio_estimado','min_esperado','max_esperado']
     """
     if pasos < 1:
         raise ValueError("El numero de 'pasos' debe ser >= 1.")
@@ -144,49 +126,43 @@ def predecir_precio_arima(
     modo = modelo.get('modo', 'nivel')
     ultimo_close = modelo.get('ultimo_close', None)
 
-    # Forecast multi-step
     fc = fitted.get_forecast(steps=pasos)
-    mean = fc.predicted_mean  # Serie (n,)
-    conf = fc.conf_int(alpha=alpha)  # DataFrame 2 columnas
+    mean = fc.predicted_mean
+    conf = fc.conf_int(alpha=alpha)
 
-    # Algunas versiones nombran columnas como ['lower y', 'upper y'] o similar.
     low = conf.iloc[:, 0].to_numpy(dtype=float)
     up  = conf.iloc[:, 1].to_numpy(dtype=float)
     mean_np = mean.to_numpy(dtype=float)
 
-    # Construir índice futuro
     future_index = _build_future_index(last_time, pasos, frecuencia, fallback_freq)
 
     if modo == 'retornos':
         if ultimo_close is None:
             raise ValueError("No se encontró 'ultimo_close' para reconstruir precio en modo 'retornos'.")
 
-        # Reconstruimos trayectoria de precio a partir de retornos pronosticados
-        # mean: retornos esperados por paso (aprox). Usamos acumulado multiplicativo.
-        price_path = ultimo_close * np.cumprod(1.0 + mean_np)
-
-        # Bandas aproximadas: aplicamos las bandas de retornos a la reconstrucción
-        # (asunción simplificadora; documentar en tesis)
-        price_low = ultimo_close * np.cumprod(1.0 + low)
+        price_est = ultimo_close * np.cumprod(1.0 + mean_np)
+        price_lo  = ultimo_close * np.cumprod(1.0 + low)
         price_up  = ultimo_close * np.cumprod(1.0 + up)
 
         out = pd.DataFrame({
             'timestamp_prediccion': future_index,
-            'precio_estimado': price_path,
-            'min_esperado': price_low,
-            'max_esperado': price_up
+            'precio_estimado': price_est.astype(float),
+            'min_esperado': price_lo.astype(float),
+            'max_esperado': price_up.astype(float)
         })
-
-    else:  # modo == 'nivel'
+    else:
         out = pd.DataFrame({
             'timestamp_prediccion': future_index,
-            'precio_estimado': mean_np,
-            'min_esperado': low,
-            'max_esperado': up
+            'precio_estimado': mean_np.astype(float),
+            'min_esperado': low.astype(float),
+            'max_esperado': up.astype(float)
         })
 
-    # Garantizamos tipos float
-    out['precio_estimado'] = out['precio_estimado'].astype(float)
-    out['min_esperado']    = out['min_esperado'].astype(float)
-    out['max_esperado']    = out['max_esperado'].astype(float)
     return out
+
+# --- Alias opcionales de compatibilidad ---
+# (si en algún punto tu registry o main busca estos nombres genéricos)
+entrenar_modelo = entrenar_modelo_arima
+predecir_precio = predecir_precio_arima
+
+__all__ = ["entrenar_modelo_arima", "predecir_precio_arima", "entrenar_modelo", "predecir_precio"]

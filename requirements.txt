@@ -1,33 +1,37 @@
-# Núcleo científico
-numpy>=1.24
-pandas>=2.0
-scipy>=1.11
+# ========= Mark_I Project Requirements =========
+# Python 3.10–3.11 (Windows 64-bit recomendado)
 
-# Modelado clásico
-statsmodels>=0.14     # ARIMA/ETS, OLS (HAR)
+# Núcleo numérico / datos
+numpy>=1.24,<2
+pandas>=1.5
+scipy>=1.10
 
-# ML / escalado
-scikit-learn>=1.3
+# Series clásicas / econometría
+statsmodels>=0.14
+arch>=6.3
 
-# LSTM (opcional; se omite si no está disponible)
-tensorflow>=2.16 ; platform_system!="Linux" or python_version>="3.10"
-
-# Volatilidad
-arch>=6.2             # GARCH(1,1)
-
-# Gráficos
-matplotlib>=3.8
-
-# Configuración
-PyYAML>=6.0
-
-# Prophet (opcional para modo "prophet" y para competir en "auto")
+# Prophet (moderno)
 prophet>=1.1.5
 cmdstanpy>=1.2
 
-# MetaTrader 5 (solo Windows)
-MetaTrader5>=5.0 ; platform_system=="Windows"
+# ML utilidades
+scikit-learn>=1.3
+joblib>=1.3
 
-# Utilidades extra usadas
-beautifulsoup4>=4.12  # calendario (scraping sencillo)
-openpyxl>=3.1         # exportar a Excel (ruta_reporte)
+# Deep Learning (LSTM) – stack coherente
+tensorflow-cpu==2.16.2
+tensorboard==2.16.2
+ml-dtypes==0.3.2
+protobuf==4.25.3
+
+# Gráficos / Reportes
+matplotlib>=3.7
+openpyxl>=3.1
+xlsxwriter>=3.1
+
+# Config / CLI
+PyYAML>=6.0
+tqdm>=4.66
+
+# Conexión MT5 (opcional)
+MetaTrader5>=5.0.45

@@ -1,75 +1,143 @@
-# === Configuración General ===
+# ================================
+# CONFIGURACIÓN GENERAL DEL PROYECTO
+# ================================
+
+# Símbolo principal a descargar desde MetaTrader 5.
 simbolo: "EURUSD"
-timeframe: "D1"
-cantidad_datos: 2000
 
-modelo: "auto"
-pasos_prediccion: 20
-frecuencia_prediccion: "1D"
-umbral_senal: 0.0010
-pip_size: 0.0001
+# (Opcional) Símbolo exógeno (p.ej., US500/SPX/SPY) si lo habilitas en bt.exog.enable
+simbolo_spy: "US500"
 
-# === Reportes ===
-ruta_reporte: "outputs/reporte_inversion.xlsx"
+# Timeframe para la descarga desde MT5 (válidos: M1/M5/M15/M30/H1/H4/D1/W1/MN1)
+timeframe: "H1"
 
-# === EDA (CRISP-DM) ===
-eda:
-  habilitar: true
-  frecuencia_resampleo: "D"
-  outdir: "outputs/eda"
-  ventana_media_movil: 30
-  acf_lags: 60
-  rolling_vol_windows: [20, 60, 120]
-  rolling_corr_window: 120
-  export_pdf: true
-  pdf_filename: "EDA_informe.pdf"
-  alias_eur: "EURUSD"
-  alias_spy: "US500"
+# Cuántas barras traer desde MT5 antes de cualquier recorte/resampleo.
+cantidad_datos: 1500
 
-# === SPY para EDA ===
-simbolo_spy: ".US500Cash"
-
-# === MT5 ===
+# Conexión a MetaTrader 5
 mt5:
   login: 68238343
   password: "Colombia123*"
   server: "RoboForex-Pro"
   path: "C:\\Program Files\\RoboForex - MetaTrader 5\\terminal64.exe"
 
-# === Backtest ===
+# ================================
+# EDA (Exploratory Data Analysis)
+# ================================
+eda:
+  # Frecuencia de resampleo para estandarizar OHLC antes de los análisis.
+  # H = intradía por horas (H1/H4); D = diario.
+  frecuencia_resampleo: "H"
+
+# ================================
+# MODO NORMAL (compatibilidad)
+# ================================
+# Se usará solo si NO existe 'modelos:' con activos.
+modelo:
+  nombre: "ARIMA"           # "ARIMA" | "SARIMA" | "PROPHET" | "LSTM"
+  objetivo: "retornos"      # "retornos" | "nivel"
+  horizonte: 5
+  params:
+    order: [1, 1, 1]
+    seasonal_order: [0, 0, 0, 0]
+    enforce_stationarity: false
+    enforce_invertibility: false
+
+# ================================
+# CATÁLOGO DE MODELOS (multi-modelo)
+# ================================
+# El pipeline ejecuta TODOS los modelos con enabled: true, en el modo seleccionado (normal o backtest).
+modelos:
+  - name: "ARIMA"
+    enabled: true
+    objetivo: "retornos"
+    horizonte: 5
+    params:
+      order: [1,1,1]
+      seasonal_order: [0,0,0,0]
+      enforce_stationarity: false
+      enforce_invertibility: false
+    normal: {}
+    backtest:
+      engine: "classic_auto" 
+
+  - name: "PROPHET"
+    enabled: true
+    objetivo: "retornos"
+    horizonte: 5
+    params:
+      frequency_hint: "H"          # CLAVE para intradía H1/H4
+      changepoint_prior_scale: 0.05
+      seasonality_mode: "additive"
+    normal: {}
+    backtest:
+      engine: "model"
+      prophet:
+        frequency_hint: "H"
+        yearly_seasonality: false
+        weekly_seasonality: true
+        daily_seasonality: true
+        interval_width: 0.9
+
+  - name: "LSTM"
+    enabled: true
+    objetivo: "retornos"
+    horizonte: 5
+    params:
+      window: 64
+      units: 64
+      dropout: 0.2
+      epochs: 40
+      batch_size: 32
+      lr: 0.001
+      loss: "mse"
+      optimizer: "adam"
+      scaler: "standard"
+      patience: 5
+      model_dir: "outputs/modelos/lstm"
+    normal: {}
+    backtest:
+      engine: "model"
+      lstm:
+        horizon: 5
+
+# ================================
+# BACKTEST (walk-forward)
+# ================================
 bt:
-  target: "returns"           # retornos (Δlog)
-  initial_train: 1200
-  step: 5
+  initial_train: 800
+  step: 50
   horizon: 1
+  target: "returns"         # 'returns' | 'level'
   pip_size: 0.0001
 
-  # UMBRAL (elige uno u otro en threshold_mode)
-  threshold_mode: "garch"       # "fixed" | "atr" | "garch"
-  threshold_pips: 6         # si mode=fixed
-  atr_window: 14              # si mode=atr
-  atr_k: 0.25                 # si mode=atr (sensibilidad)
-  min_threshold_pips: 4     # piso mínimo de pips (atr/garch)
-  garch_k: 1.0               # si mode=garch: sensibilidad sobre sigma_t+1 (pips)
+  # Umbrales de decisión
+  threshold_mode: "fixed"   # 'fixed' | 'atr' | 'garch'
+  threshold_pips: 12.0
+  atr_window: 14
+  atr_k: 0.60
+  garch_k: 0.60
+  min_threshold_pips: 10.0
+  log_threshold_used: false
 
-  # Guardar detalle y log de umbrales
-  save_detail: true
-  log_threshold_used: true
+  # Auto-modelo (ARIMA/SARIMA)
+  auto:
+    scan: {}
+    rescan_each_refit: false
+    rescan_every_refits: 999999
 
-  decision:
-    type: "zscore"   # "pips" (actual), o "zscore" para activar la regla por z
-    z_thr: 0.20    # umbral de z (sólo usado si type="zscore")
+  # Exógenas (opcional)
+  exog:
+    enable: false
+    lags: [1, 2, 3]
 
+  # Salidas
   outxlsx: "outputs/evaluacion.xlsx"
   outdir_plots: "outputs/backtest_plots"
 
-  auto:
-    scan:
-      try_sarima: true
-      max_p: 1
-      max_q: 1  
-      max_P: 0
-      max_Q: 1
-      s_candidates: [5]
-    rescan_each_refit: false
-    rescan_every_refits: 20
+# ================================
+# DEFAULTS POR MODO (opcional)
+# ================================
+defaults:
+  normal: {}
+  backtest: {}
