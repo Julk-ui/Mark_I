@@ -15,7 +15,7 @@ import re
 import yaml
 import numpy as np
 import pandas as pd
-from pathlib import Path
+from pathlib import Path  # [ADDED] Asegura Path disponible en todo el archivo
 
 # Import para exportadores “ligeros” (CSV / XLSX consolidado por clase)
 # Nota: estas funciones son adicionales y NO reemplazan el exportador
@@ -497,14 +497,17 @@ def run_modo_backtest(df: pd.DataFrame, price_col: str, config: dict) -> None:
 def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> None:
     """
     Modo backtest multimodelo:
-    - Ejecuta Prophet/LSTM (engine=model).
-    - Si ARIMA (o SARIMA) está enabled en `modelos:`, también ejecuta el bloque classic_auto
-      y consolida todo en el exportador centralizado (si está).
+    - Ejecuta los modelos de clase (Prophet/LSTM) con engine=model y exporta sus CSV.
+    - Si ARIMA/SARIMA están habilitados, corre classic_auto y agrega sus resultados.
+    - Finalmente consolida todo en el exportador Excel centralizado (si existe).
+    *No elimina lógica previa; solo ordena llamadas y evita imports locales.*
     """
     models = _collect_active_models(config)
     if not models:
+        # Si no hay lista de modelos, usa el flujo único
         return run_modo_backtest(df, price_col, config)
 
+    # ------------------------ Datos base ------------------------
     price = df[price_col].astype(float)
     bt = config.get("bt", {})
     initial_train = int(bt.get("initial_train", 1500))
@@ -512,19 +515,11 @@ def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> N
     horizon = int(bt.get("horizon", 1))
     target = str(bt.get("target", "returns")).lower()
     freq = config.get("eda", {}).get("frecuencia_resampleo", "H")
-    outdir_multi = Path(bt.get("outdir_plots", "outputs/backtest_multi"))
-    outdir_multi.mkdir(parents=True, exist_ok=True)
+    pip_size = float(bt.get("pip_size", 0.0001))
+    threshold_mode = str(bt.get("threshold_mode", "fixed")).lower()
+    threshold_pips = float(bt.get("threshold_pips", 12.0))
 
-    # 1) Prophet/LSTM (class-based adapters)
-    class_models = [m for m in models if m["name"].strip().lower() in {"prophet", "lstm"} and m.get("enabled", True)]
-    cfg_global = {
-        "freq": "H" if str(freq).upper().startswith("H") else "D",
-        "target": target,
-        "backtest": {"ventanas": initial_train, "step": step, "horizon": horizon}
-    }
-    pred_map_class = run_backtest_many(price, class_models, cfg_global)
-
-    # --- Normaliza el símbolo para nombres de archivo ---
+    # Normalización de símbolo para nombres de archivo
     _raw_symbol = (
         config.get("simbolo")
         or config.get("symbol")
@@ -534,43 +529,74 @@ def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> N
     )
     symbol_safe = re.sub(r"[^A-Za-z0-9_]+", "_", str(_raw_symbol).strip().upper())
 
-    # 1) CSV por modelo (inspección rápida)
+    outdir_multi = Path(bt.get("outdir_plots", "outputs/backtest_plots"))
+    outdir_multi.mkdir(parents=True, exist_ok=True)
+
+    # ----------------- 1) Modelos de CLASE (Prophet/LSTM) -----------------
+    class_models = [m for m in models if m["name"].strip().lower() in {"prophet", "lstm"} and m.get("enabled", True)]
+    cfg_global = {
+        "freq": "H" if str(freq).upper().startswith("H") else "D",
+        "target": target,
+        "backtest": {"ventanas": initial_train, "step": step, "horizon": horizon}
+    }
+    pred_map_class = run_backtest_many(price, class_models, cfg_global)
+
+    # Guardar CSV por modelo de clase (inspección rápida) + contexto para métricas
     export_backtest_csv_per_model(
         symbol=symbol_safe,
         pred_map=pred_map_class,
         price=price,
-        outdir=outdir_multi
+        outdir=outdir_multi,
+        target=target,
+        pip_size=pip_size,
+        threshold_mode=threshold_mode,
+        threshold_pips=threshold_pips,
+        horizon=horizon,
+        initial_train=initial_train,
     )
 
-    # 2) Excel consolidado con hoja "metrics" + una hoja por cada modelo
+    # Excel consolidado por clase (opcional): hoja "metrics" + hojas por modelo
     tf = str(config.get("timeframe", "H1")).upper()
-    annual = 24*252 if tf.startswith("H") else 252 if tf.startswith("D") else None
+    annual = 24 * 252 if tf.startswith("H") else 252 if tf.startswith("D") else None
+    per_model_params = {str(m.get("name", "")).upper(): (m.get("params", {}) or {}) for m in config.get("modelos", [])}
+
     excel_path = outdir_multi / f"{symbol_safe}_backtest_consolidado.xlsx"
     export_backtest_excel_consolidado(
         symbol=symbol_safe,
         pred_map=pred_map_class,
         price=price,
         excel_path=excel_path,
+        target=target,
+        pip_size=pip_size,
+        threshold_mode=threshold_mode,
+        threshold_pips=threshold_pips,
+        horizon=horizon,
+        annualization=annual,
+        per_model_params=per_model_params,
+        config_info=config,
         seasonality_m=1,
-        annualization=annual
+        initial_train=initial_train,
     )
+    print(f"💾 XLSX consolidado por clase guardado en: {excel_path}")
 
-    # CSV normalizados por modelo (retrocompatibilidad)
+    # Además guarda CSV normalizados por modelo (retrocompatibilidad)
     for name, mat in pred_map_class.items():
         name_safe = _safe_model_tag(name)
-        out = outdir_multi / f"{config.get('simbolo','SYMB')}_{name_safe}_backtest.csv"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        _normalize_for_csv(mat, price=price).to_csv(out, index=True)
-        print(f"💾 [{name}] Backtest guardado en {out}")
+        out_csv = outdir_multi / f"{config.get('simbolo','SYMB')}_{name_safe}_backtest.csv"
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        _normalize_for_csv(mat, price=price).to_csv(out_csv, index=True)
+        print(f"💾 [{name}] Backtest guardado en {out_csv}")
 
-    # 3) ¿Hay ARIMA/SARIMA enabled en `modelos:`? ejecuta classic_auto y agrega
-    has_arima = any(m.get("enabled", True) and m.get("name", "").strip().lower() in {"arima", "sarima"} for m in models)
+    # ----------------- 2) ¿ARIMA/SARIMA habilitados? -----------------
+    has_arima = any(
+        m.get("enabled", True) and m.get("name", "").strip().lower() in {"arima", "sarima"}
+        for m in models
+    )
     merged_map: Dict[str, Any] = dict(pred_map_class)
+    summary_auto = None
 
     if has_arima:
-        pip_size = float(bt.get("pip_size", 0.0001))
-        threshold_mode = str(bt.get("threshold_mode", "garch")).lower()
-        threshold_pips = float(bt.get("threshold_pips", 12.0))
+        # Prepara insumos de umbral/volatilidad
         atr_window = int(bt.get("atr_window", 14))
         atr_k = float(bt.get("atr_k", 0.60))
         garch_k = float(bt.get("garch_k", 0.60))
@@ -583,10 +609,13 @@ def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> N
 
         specs = [
             {"name": "RW_RETURNS", "kind": "rw"},
-            {"name": "AUTO(ARIMA/SARIMA)_RET", "kind": "auto",
-             "scan": bt.get("auto", {}).get("scan", {}),
-             "rescan_each_refit": bt.get("auto", {}).get("rescan_each_refit", False),
-             "rescan_every_refits": bt.get("auto", {}).get("rescan_every_refits", 25)},
+            {
+                "name": "AUTO(ARIMA/SARIMA)_RET",
+                "kind": "auto",
+                "scan": bt.get("auto", {}).get("scan", {}),
+                "rescan_each_refit": bt.get("auto", {}).get("rescan_each_refit", False),
+                "rescan_every_refits": bt.get("auto", {}).get("rescan_every_refits", 25),
+            },
         ]
         print(f"[AUTO] step={step}, horizon={horizon}, target={target}, thr_mode={threshold_mode}")
 
@@ -600,7 +629,7 @@ def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> N
             log_threshold_used=log_threshold_used
         )
 
-        # Guarda CSVs para ARIMA/SARIMA map
+        # Guarda CSV para el mapa ARIMA/SARIMA y RW
         for k, v in preds_map_auto.items():
             k_safe = _safe_model_tag(k)
             out = outdir_multi / f"{config.get('simbolo','SYMB')}_{k_safe}_backtest.csv"
@@ -608,24 +637,22 @@ def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> N
             _normalize_for_csv(v, price=price).to_csv(out, index=True)
             print(f"💾 [{k}] Backtest guardado en {out}")
 
+        # Mezcla resultados
         merged_map.update(preds_map_auto)
-    else:
-        summary_auto = None
 
-    # 4) Consolidación Excel centralizada (si existe)
+    # ----------------- 3) Exportador Excel centralizado (todo) -----------------
     if _exportar_excel is not None:
         try:
             _exportar_excel(
                 path_xlsx=bt.get("outxlsx", "outputs/evaluacion.xlsx"),
                 price=price,
                 preds_map=merged_map,
-                summary=summary_auto,  # puede ser None
+                summary=summary_auto,  # puede ser None si no hubo ARIMA/SARIMA
                 config=config
             )
             print("💾 Reporte (centralizado) consolidado para modelos por clase y ARIMA/SARIMA.")
         except Exception as e:
             print(f"⚠️ Exportador centralizado falló en multi: {e}")
-
 
 # =============  CLI principal  =============
 
