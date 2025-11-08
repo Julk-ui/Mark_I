@@ -1,0 +1,141 @@
+simbolo: EURUSD
+simbolo_spy: US500
+timeframe: D1
+cantidad_datos: 1500
+mt5:
+  login: 68238343
+  password: Colombia123*
+  server: RoboForex-Pro
+  path: C:\Program Files\RoboForex - MetaTrader 5\terminal64.exe
+eda:
+  frecuencia_resampleo: D
+modelo:
+  nombre: ARIMA
+  objetivo: retornos
+  horizonte: 5
+  params:
+    order:
+    - 0
+    - 1
+    - 2
+    seasonal_order:
+    - 0
+    - 0
+    - 0
+    - 0
+    enforce_stationarity: false
+    enforce_invertibility: false
+validacion:
+  modo: last_n
+  n: 500
+modelos:
+- name: ARIMA
+  enabled: true
+  objetivo: retornos
+  horizonte: 5
+  params:
+    auto: false
+    metric: aic
+    seasonal: false
+    m: 12
+    modo: retornos
+    max_p: 2
+    max_q: 2
+    max_P: 2
+    max_Q: 2
+    max_d: 2
+    max_D: 1
+    enforce_stationarity: false
+    enforce_invertibility: false
+    order:
+    - 0
+    - 1
+    - 2
+  normal: {}
+  backtest:
+    engine: model
+- name: RW
+  enabled: true
+  objetivo: retornos
+  horizonte: 5
+  params:
+    order:
+    - 0
+    - 1
+    - 0
+    seasonal_order:
+    - 0
+    - 0
+    - 0
+    - 0
+    enforce_stationarity: false
+    enforce_invertibility: false
+  normal: {}
+  backtest:
+    engine: classic_auto
+- name: PROPHET
+  enabled: true
+  objetivo: retornos
+  horizonte: 5
+  params:
+    frequency_hint: D1
+    changepoint_prior_scale: 0.5
+    seasonality_mode: multiplicative
+  normal: {}
+  backtest:
+    engine: model
+    prophet:
+      frequency_hint: D1
+      yearly_seasonality: false
+      weekly_seasonality: true
+      daily_seasonality: true
+      interval_width: 0.9
+- name: LSTM
+  enabled: true
+  objetivo: retornos
+  horizonte: 5
+  params:
+    window: 64
+    units: 64
+    dropout: 0.2
+    epochs: 40
+    batch_size: 32
+    lr: 0.001
+    loss: mse
+    optimizer: adam
+    scaler: standard
+    patience: 5
+    model_dir: outputs/modelos/lstm
+  normal: {}
+  backtest:
+    engine: model
+    lstm:
+      horizon: 5
+bt:
+  initial_train: 800
+  step: 50
+  horizon: 1
+  target: returns
+  pip_size: 0.0001
+  threshold_mode: fixed
+  threshold_pips: 12.0
+  atr_window: 14
+  atr_k: 0.6
+  garch_k: 0.6
+  min_threshold_pips: 10.0
+  log_threshold_used: false
+  auto:
+    scan: {}
+    rescan_each_refit: false
+    rescan_every_refits: 999999
+  exog:
+    enable: false
+    lags:
+    - 1
+    - 2
+    - 3
+  outxlsx: outputs/evaluacion.xlsx
+  outdir_plots: outputs/backtest_plots
+defaults:
+  normal: {}
+  backtest: {}
