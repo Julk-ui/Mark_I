@@ -371,16 +371,33 @@ class ProphetFuncAdapter:
 # ==============================
 # Fábrica principal
 # ==============================
+# ==============================
+# Fábrica principal (actualizada)
+# ==============================
 def get_model(nombre: str, cfg: Dict[str, Any]) -> ModelLike:
     """
     Devuelve un modelo con interfaz unificada .fit/.predict.
-      - "ARIMA" / "SARIMA" -> adapter funcional (ArimaFuncAdapter)
-      - "PROPHET"          -> adapter funcional (ProphetFuncAdapter)
-      - "LSTM"             -> clase directa (modelos.lstm_model.LSTMModel)
+
+    Ahora para ARIMA/SARIMA:
+      1) Intenta usar clase modelos.arima.adapter.ArimaModel (salida 'yhat' como LSTM)
+      2) Si no existe, cae al adapter funcional (ArimaFuncAdapter) que normaliza a 'yhat'
     """
     name = (nombre or "").strip().upper()
 
     if name in {"ARIMA", "SARIMA"}:
+        # Preferencia: adapter orientado a clase si está disponible
+        try:
+            mod = importlib.import_module("modelos.arima.adapter")
+            if hasattr(mod, "ArimaModel"):
+                ArimaModel = getattr(mod, "ArimaModel")
+                # El constructor acepta (model_cfg, cfg) como en el adapter de clase que te pasé
+                return ArimaModel(
+                    model_cfg=cfg.get("params") or {},
+                    cfg={**cfg}  # pasa hints globales si los tuvieras
+                )
+        except Exception:
+            # Si hay cualquier problema, usa el wrapper funcional existente
+            pass
         return ArimaFuncAdapter(cfg)
 
     if name == "PROPHET":

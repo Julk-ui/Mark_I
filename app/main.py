@@ -533,7 +533,7 @@ def run_modo_backtest_multi(df: pd.DataFrame, price_col: str, config: dict) -> N
     outdir_multi.mkdir(parents=True, exist_ok=True)
 
     # ----------------- 1) Modelos de CLASE (Prophet/LSTM) -----------------
-    class_models = [m for m in models if m["name"].strip().lower() in {"prophet", "lstm"} and m.get("enabled", True)]
+    class_models = [m for m in models if m["name"].strip().lower() in {"prophet", "lstm", "arima"} and m.get("enabled", True)]
     cfg_global = {
         "freq": "H" if str(freq).upper().startswith("H") else "D",
         "target": target,

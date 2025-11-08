@@ -1,168 +1,265 @@
 # modelos/arima/adapter.py
-# Adapter ARIMA/SARIMA compatible con tu main.py (modo normal)
-# Requisitos: statsmodels>=0.13, pandas, numpy
+# ARIMA/SARIMA adapter con selección automática por ventana (pmdarima)
+# - Interfaz homogénea con LSTM:
+#     .fit(series: pd.Series)              -> entrena
+#     .predict(horizon, last_window=None,
+#               last_timestamp=None,
+#               index=None) -> DataFrame   -> SIEMPRE columna 'yhat' e índice temporal
+# - Modo 'nivel' (precio) o 'retornos' (reconstruye precio desde el último close)
+# - Auto-selección por ventana con límites de búsqueda (max_p,max_q,max_P,max_Q <= 2)
+# - Expone metadatos del modelo elegido con .info()
 
 from __future__ import annotations
-import pandas as pd
-import numpy as np
 from typing import Optional, Dict, Any, Tuple
+import numpy as np
+import pandas as pd
+
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-# -------------------------------
-# Helpers internos
-# -------------------------------
-def _ensure_time_index(df: pd.DataFrame) -> pd.DatetimeIndex:
+# pmdarima para selección automática
+try:
+    import pmdarima as pm
+except Exception as e:
+    pm = None
+
+
+class ArimaModel:
     """
-    Usa columna 'time' o índice datetime. Ordena ascendente si es necesario.
+    Adapter ARIMA/SARIMA univar con salida 'yhat' (igual a LSTM).
     """
-    if 'time' in df.columns:
-        idx = pd.to_datetime(df['time'])
-    elif isinstance(df.index, pd.DatetimeIndex):
-        idx = df.index
-    else:
-        raise ValueError("Se requiere columna 'time' o índice datetime en el DataFrame.")
-    if not idx.is_monotonic_increasing:
-        df2 = df.copy()
-        df2.index = idx
-        df2 = df2.sort_index()
-        return df2.index
-    return idx
 
-def _validate_and_prepare(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Valida columnas mínimas y devuelve df ordenado por tiempo sin NaN en Close.
-    """
-    if 'Close' not in df.columns:
-        raise ValueError("El DataFrame debe contener la columna 'Close'.")
+    def __init__(self,
+                 model_cfg: Optional[Dict[str, Any]] = None,
+                 cfg: Optional[Dict[str, Any]] = None) -> None:
+        model_cfg = model_cfg or {}
+        cfg = cfg or {}
 
-    idx = _ensure_time_index(df)
-    base = df.copy()
-    base.index = idx
-    base = base.sort_index()
-    base = base[['Close']].astype(float).dropna()
-    if len(base) < 30:
-        raise ValueError("Muy pocos datos para ARIMA/SARIMA (mín ~30 observaciones).")
-    return base
+        # ------------------------------
+        # Config general
+        # ------------------------------
+        self.modo: str = str(model_cfg.get("modo", cfg.get("modo", "nivel"))).lower()
+        if self.modo not in {"nivel", "retornos"}:
+            self.modo = "nivel"
 
-def _build_future_index(last_time: pd.Timestamp, pasos: int, frecuencia: Optional[str], fallback: str) -> pd.DatetimeIndex:
-    """
-    Construye el índice futuro usando la frecuencia proporcionada o inferida.
-    """
-    freq = frecuencia or fallback or 'D'
-    # Genera 'pasos' timestamps futuros excluyendo el último ya presente
-    future_index = pd.date_range(start=last_time, periods=pasos+1, freq=freq)[1:]
-    return future_index
+        # Frecuencia para construir índice futuro si no se pasa 'index'
+        self._freq_cfg: str = str(cfg.get("freq", "H"))
 
-# -------------------------------
-# API pública del adapter
-# -------------------------------
-def entrenar_modelo_arima(
-    df: pd.DataFrame,
-    modo: str = 'nivel',                 # 'nivel' | 'retornos'
-    order: Tuple[int, int, int] = (1, 1, 1),
-    seasonal_order: Optional[Tuple[int, int, int, int]] = None,  # (P,D,Q,m); si None -> no estacional
-    enforce_stationarity: bool = False,
-    enforce_invertibility: bool = False,
-) -> Dict[str, Any]:
-    """
-    Ajusta ARIMA (o SARIMA si se provee seasonal_order) de forma compatible con main.py.
-    - df: DataFrame con ['time','Close'] o índice datetime.
-    - modo:
-        'nivel'    -> modela precio (Close)
-        'retornos' -> modela retornos (pct_change) y reconstruye precio al predecir
-    """
-    base = _validate_and_prepare(df)
-    idx = base.index
+        # ------------------------------
+        # Selección automática (pmdarima)
+        # ------------------------------
+        self.auto: bool = bool(model_cfg.get("auto", True))
+        self.metric: str = str(model_cfg.get("metric", "aic")).lower()  # "aic" | "bic"
+        self.seasonal: bool = bool(model_cfg.get("seasonal", False))
+        self.m: int = int(model_cfg.get("m", 12 if self.seasonal else 1))
 
-    if modo not in ('nivel', 'retornos'):
-        raise ValueError("Parametro 'modo' debe ser 'nivel' o 'retornos'.")
+        # Límites de búsqueda (topes seguros para que no explote)
+        self.max_p: int = int(model_cfg.get("max_p", 2))
+        self.max_q: int = int(model_cfg.get("max_q", 2))
+        self.max_P: int = int(model_cfg.get("max_P", 2))
+        self.max_Q: int = int(model_cfg.get("max_Q", 2))
+        self.max_d: int = int(model_cfg.get("max_d", 2))   # differencing no estacional
+        self.max_D: int = int(model_cfg.get("max_D", 1))   # differencing estacional
 
-    if modo == 'retornos':
-        y = base['Close'].pct_change().dropna()
-        ultimo_close = float(base['Close'].iloc[-1])
-    else:
-        y = base['Close']
-        ultimo_close = None
+        # Parámetros fijos si auto=False
+        self.order: Tuple[int, int, int] = tuple(model_cfg.get("order", (1, 1, 1)))
+        self.seasonal_order: Tuple[int, int, int, int] = tuple(model_cfg.get("seasonal_order", (0, 0, 0, 0)))
 
-    seasonal_order = seasonal_order if seasonal_order is not None else (0, 0, 0, 0)
+        # Flags de restricciones (más laxo para evitar fallos de convergencia)
+        self.enforce_stationarity: bool = bool(model_cfg.get("enforce_stationarity", False))
+        self.enforce_invertibility: bool = bool(model_cfg.get("enforce_invertibility", False))
 
-    model = SARIMAX(
-        y,
-        order=order,
-        seasonal_order=seasonal_order,
-        enforce_stationarity=enforce_stationarity,
-        enforce_invertibility=enforce_invertibility,
-        trend=None,
-    )
-    fitted = model.fit(disp=False)
+        # ------------------------------
+        # Estado tras el fit
+        # ------------------------------
+        self._results = None                        # SARIMAXResults
+        self._train_index: Optional[pd.DatetimeIndex] = None
+        self._ultimo_close: Optional[float] = None  # base para reconstrucción (modo 'retornos')
+        self._chosen: Dict[str, Any] = {}           # metadatos del mejor modelo en la ventana
 
-    freq_inferida = pd.infer_freq(idx)
-    last_time = idx.max()
+    # ======================================================================
+    # API pública
+    # ======================================================================
+    def fit(self, series: pd.Series) -> None:
+        """
+        Entrena el modelo con una pd.Series univar (índice datetime, orden ascendente).
+        En modo 'retornos' modela pct_change() y guarda el último close para reconstruir.
+        """
+        s = pd.Series(series).astype(float).dropna()
+        if not isinstance(s.index, pd.DatetimeIndex):
+            raise ValueError("La serie debe tener índice de tiempo (DatetimeIndex).")
+        s = s.sort_index()
 
-    return {
-        'fitted': fitted,
-        'last_time': last_time,
-        'freq': freq_inferida or 'D',
-        'modo': modo,
-        'ultimo_close': ultimo_close,
-    }
+        self._train_index = s.index
 
-def predecir_precio_arima(
-    modelo: Dict[str, Any],
-    pasos: int = 3,
-    frecuencia: Optional[str] = None,
-    alpha: float = 0.10,  # 90% CI por defecto
-) -> pd.DataFrame:
-    """
-    Predice 'pasos' periodos hacia adelante y devuelve:
-      ['timestamp_prediccion','precio_estimado','min_esperado','max_esperado']
-    """
-    if pasos < 1:
-        raise ValueError("El numero de 'pasos' debe ser >= 1.")
+        if self.modo == "retornos":
+            y = s.pct_change().dropna()
+            if len(y) < 30:
+                raise ValueError("Muy pocos datos para ARIMA en 'retornos' (mínimo recomendado ~30).")
+            self._ultimo_close = float(s.iloc[-1])
+        else:
+            y = s
+            if len(y) < 30:
+                raise ValueError("Muy pocos datos para ARIMA en 'nivel' (mínimo recomendado ~30).")
+            self._ultimo_close = None
 
-    fitted = modelo['fitted']
-    last_time = modelo['last_time']
-    fallback_freq = modelo.get('freq', 'D')
-    modo = modelo.get('modo', 'nivel')
-    ultimo_close = modelo.get('ultimo_close', None)
+        # ------------------------------
+        # Selección automática por ventana
+        # ------------------------------
+        if self.auto:
+            if pm is None:
+                raise RuntimeError(
+                    "pmdarima no está disponible. Instala 'pmdarima' o desactiva auto=True "
+                    "y provee 'order'/'seasonal_order'."
+                )
 
-    fc = fitted.get_forecast(steps=pasos)
-    mean = fc.predicted_mean
-    conf = fc.conf_int(alpha=alpha)
+            # clamp de seguridad por si el usuario configura >2
+            max_p = max(0, min(int(self.max_p), 2))
+            max_q = max(0, min(int(self.max_q), 2))
+            max_P = max(0, min(int(self.max_P), 2))
+            max_Q = max(0, min(int(self.max_Q), 2))
+            max_d = max(0, int(self.max_d))
+            max_D = max(0, int(self.max_D))
 
-    low = conf.iloc[:, 0].to_numpy(dtype=float)
-    up  = conf.iloc[:, 1].to_numpy(dtype=float)
-    mean_np = mean.to_numpy(dtype=float)
+            am = pm.auto_arima(
+                y,
+                seasonal=self.seasonal,
+                m=(self.m if self.seasonal else 1),
+                start_p=0, start_q=0, start_P=0, start_Q=0,
+                max_p=max_p, max_q=max_q, max_P=max_P, max_Q=max_Q,
+                max_d=max_d, max_D=max_D,
+                stepwise=True,
+                trace=False,
+                information_criterion=self.metric,  # "aic" o "bic"
+                error_action="ignore",
+                suppress_warnings=True,
+                with_intercept=False,
+            )
 
-    future_index = _build_future_index(last_time, pasos, frecuencia, fallback_freq)
+            order = am.order
+            sorder = am.seasonal_order if self.seasonal else (0, 0, 0, 0)
 
-    if modo == 'retornos':
-        if ultimo_close is None:
-            raise ValueError("No se encontró 'ultimo_close' para reconstruir precio en modo 'retornos'.")
+            # Guardamos la elección (ojo: AIC/BIC finales los tomamos del SARIMAX de abajo)
+            self._chosen = {
+                "selected_by": "pmdarima.auto_arima",
+                "metric": self.metric,
+                "order": str(order),
+                "seasonal_order": str(sorder) if sorder else "",
+                "m": int(self.m if self.seasonal else 1),
+                "max_p": max_p, "max_q": max_q, "max_P": max_P, "max_Q": max_Q,
+                "max_d": max_d, "max_D": max_D,
+            }
 
-        price_est = ultimo_close * np.cumprod(1.0 + mean_np)
-        price_lo  = ultimo_close * np.cumprod(1.0 + low)
-        price_up  = ultimo_close * np.cumprod(1.0 + up)
+        else:
+            order = tuple(self.order)
+            sorder = tuple(self.seasonal_order if self.seasonal else (0, 0, 0, 0))
+            self._chosen = {
+                "selected_by": "manual",
+                "metric": self.metric,
+                "order": str(order),
+                "seasonal_order": str(sorder) if sorder else "",
+                "m": int(self.m if self.seasonal else 1),
+            }
 
-        out = pd.DataFrame({
-            'timestamp_prediccion': future_index,
-            'precio_estimado': price_est.astype(float),
-            'min_esperado': price_lo.astype(float),
-            'max_esperado': price_up.astype(float)
+        # ------------------------------
+        # Fit final homogéneo con SARIMAX
+        # ------------------------------
+        self.order = order
+        self.seasonal_order = sorder
+
+        self._results = SARIMAX(
+            y,
+            order=order,
+            seasonal_order=sorder if self.seasonal else (0, 0, 0, 0),
+            enforce_stationarity=self.enforce_stationarity,
+            enforce_invertibility=self.enforce_invertibility,
+            trend=None,
+        ).fit(disp=False)
+
+        # métrica final del fit
+        self._chosen.update({
+            "aic": float(getattr(self._results, "aic", np.nan)),
+            "bic": float(getattr(self._results, "bic", np.nan)),
+            "nobs": int(getattr(self._results, "nobs", len(y))),
         })
-    else:
-        out = pd.DataFrame({
-            'timestamp_prediccion': future_index,
-            'precio_estimado': mean_np.astype(float),
-            'min_esperado': low.astype(float),
-            'max_esperado': up.astype(float)
+
+    def predict(self,
+                horizon: int,
+                last_window: Optional[pd.Series] = None,
+                last_timestamp: Optional[pd.Timestamp] = None,
+                index: Optional[pd.DatetimeIndex] = None) -> pd.DataFrame:
+        """
+        Devuelve SIEMPRE DataFrame con columna 'yhat' (igual a LSTM) y el índice temporal.
+        """
+        if self._results is None:
+            raise RuntimeError("ARIMA no entrenado. Llama fit() antes de predict().")
+        if horizon < 1:
+            raise ValueError("`horizon` debe ser >= 1.")
+
+        fc = self._results.get_forecast(steps=int(horizon))
+        mean = fc.predicted_mean.to_numpy(dtype=float)
+
+        if self.modo == "retornos":
+            base = self._ultimo_close
+            if base is None:
+                # fallback: tomar del last_window si no guardamos el último close
+                if last_window is None or len(last_window) == 0:
+                    raise ValueError("No se pudo reconstruir precio: falta 'ultimo_close' o 'last_window'.")
+                base = float(pd.Series(last_window).astype(float).iloc[-1])
+            yhat_vals = base * np.cumprod(1.0 + mean)
+        else:
+            yhat_vals = mean
+
+        # Índice de salida (mismo criterio que LSTM)
+        out_idx = self._make_index(horizon, last_timestamp, index)
+
+        return pd.DataFrame({"yhat": np.asarray(yhat_vals, dtype=float).reshape(-1)}, index=out_idx)
+
+    def info(self) -> Dict[str, Any]:
+        """
+        Metadatos del modelo elegido en la ventana (para resumen/Excel).
+        Incluye: order, seasonal_order, metric, aic, bic, nobs, etc.
+        """
+        base = dict(self._chosen) if self._chosen else {}
+        # también recordamos los órdenes efectivos usados en SARIMAX
+        base.update({
+            "engine": "arima",
+            "fitted_order": str(tuple(self.order)) if hasattr(self, "order") else "",
+            "fitted_seasonal_order": str(tuple(self.seasonal_order)) if hasattr(self, "seasonal_order") else "",
+            "seasonal": bool(self.seasonal),
         })
+        return base
 
-    return out
+    # ======================================================================
+    # Helpers
+    # ======================================================================
+    def _make_index(self,
+                    horizon: int,
+                    last_timestamp: Optional[pd.Timestamp],
+                    index: Optional[pd.DatetimeIndex]) -> pd.Index:
+        if index is not None:
+            try:
+                return pd.DatetimeIndex(index)
+            except Exception:
+                return pd.Index(index)
 
-# --- Alias opcionales de compatibilidad ---
-# (si en algún punto tu registry o main busca estos nombres genéricos)
-entrenar_modelo = entrenar_modelo_arima
-predecir_precio = predecir_precio_arima
+        freq = self._infer_freq_safe()
+        if last_timestamp is None:
+            # sin timestamp, usa un índice ordinal como fallback
+            return pd.RangeIndex(start=1, stop=horizon + 1, step=1)
 
-__all__ = ["entrenar_modelo_arima", "predecir_precio_arima", "entrenar_modelo", "predecir_precio"]
+        try:
+            return pd.date_range(start=pd.Timestamp(last_timestamp),
+                                 periods=horizon + 1, freq=freq)[1:]
+        except Exception:
+            return pd.RangeIndex(start=1, stop=horizon + 1, step=1)
+
+    def _infer_freq_safe(self) -> str:
+        if isinstance(self._train_index, pd.DatetimeIndex):
+            try:
+                f = pd.infer_freq(self._train_index)
+                if f:
+                    return str(f)
+            except Exception:
+                pass
+        # fallback razonable
+        return "H" if str(self._freq_cfg).upper().startswith("H") else "D"

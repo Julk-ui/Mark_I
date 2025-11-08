@@ -27,6 +27,15 @@ import pandas as pd
 # ---------------------------------------------------------------------
 # Utilidades y helpers
 # ---------------------------------------------------------------------
+def _pick_h1_column(df: pd.DataFrame):
+    """
+    Devuelve el nombre de la columna que represente el horizonte 1 si existe.
+    Soporta tanto etiqueta '1' (str) como 1 (int). Si no existe, retorna None.
+    """
+    for c in df.columns:
+        if str(c).strip() == "1":
+            return c
+    return None
 
 def _price_to_ds_ytrue(price: pd.Series | pd.DataFrame) -> pd.DataFrame:
     """
@@ -92,67 +101,121 @@ def _guess_pred_column(df: pd.DataFrame) -> Optional[str]:
 def _ensure_cols(
     df: pd.DataFrame,
     *,
-    price: pd.Series | pd.DataFrame | None,
+    price: Optional[pd.Series] = None,
     target: str = "returns",
-    horizon: int = 1,
+    horizon: Optional[int] = None
 ) -> pd.DataFrame:
     """
-    Normaliza un DataFrame de predicciones para que tenga columnas estándar:
-      - ds (datetime), y_pred, y_true (opcional si 'price' no se provee), y luego calcula:
-        error, abs_error, sq_error, direction_true, direction_pred.
+    Normaliza columnas mínimas en predicciones de cualquier motor:
+    - Asegura índice temporal 'ds'
+    - Rellena y_true / y_pred en función de lo disponible:
+        * ARIMA/RW (evaluate_many): y_pred_price -> y_pred
+        * Prophet/LSTM (matriz wide 1..H): usa '1' como y_pred si horizon=1
+        * Estandarizados (build_backtest_frame): y -> y_true, yhat -> y_pred
+    - Si llega 'price', reindexa y_true a partir del precio.
+    - Calcula error/abs_error/sq_error y direcciones si es posible.
+    - Añade 'horizon' si se provee.
     """
     out = df.copy()
 
-    # Asegurar ds
-    if "ds" not in out.columns:
-        # Si vino por índice, lo promovemos a columna ds
-        if isinstance(out.index, pd.DatetimeIndex):
-            out = out.reset_index().rename(columns={out.index.name or "index": "ds"})
+    # ---- Asegurar 'ds' en el índice
+    if isinstance(out.index, pd.DatetimeIndex):
+        out = out.sort_index()
+        out.index.name = "ds"
+    else:
+        cand = None
+        for c in out.columns:
+            if str(c).lower() in ("ds", "date", "timestamp", "time"):
+                cand = c
+                break
+        if cand is not None:
+            out[cand] = pd.to_datetime(out[cand], errors="coerce")
+            out = out.set_index(cand).sort_index()
+            out.index.name = "ds"
+        elif price is not None and len(out) <= len(price):
+            # Usa los últimos n timestamps del precio
+            idx = price.index[-len(out):]
+            out.index = pd.DatetimeIndex(idx, name="ds")
+            out = out.sort_index()
         else:
-            raise KeyError("El DataFrame de predicciones debe contener la columna 'ds'.")
-    out["ds"] = _coerce_datetime_series(out["ds"])
+            raise KeyError("El DataFrame de predicciones debe contener la columna 'ds' o permitir inferirla con 'price'.")
 
-    # Asegurar y_pred
-    pred_col = _guess_pred_column(out)
-    if pred_col is None:
-        raise KeyError("No se encontró columna de predicción (y_pred/yhat/1/... ) en el DataFrame.")
-    if pred_col != "y_pred":
-        out = out.rename(columns={pred_col: "y_pred"})
+    # ---- Detectar 'y_true' y 'y_pred' según el origen de datos
+    cols = set(map(str, out.columns))
 
-    # Asegurar y_true si hay 'price'
-    if price is not None:
-        p = _price_to_ds_ytrue(price)
-        out = out.merge(p, on="ds", how="left")
+    # (A) Formato estandarizado (build_backtest_frame)
+    if ("y" in cols) and ("yhat" in cols):
+        out["y_true"] = pd.to_numeric(out["y"], errors="coerce")
+        out["y_pred"] = pd.to_numeric(out["yhat"], errors="coerce")
+
+    # (B) Detectar predicción (y_pred)
+    # (B.1) Formato 'classic_auto' (ARIMA/RW)
+    if "y_pred_price" in out.columns:
+        out["y_pred"] = pd.to_numeric(out["y_pred_price"], errors="coerce")
+    elif "yhat" in out.columns:
+        out["y_pred"] = pd.to_numeric(out["yhat"], errors="coerce")
+
+    # (B.2) Formato 'model' (Prophet/LSTM) - usar la columna real del horizonte 1 (int o str)
     else:
-        if "y_true" not in out.columns:
-            out["y_true"] = np.nan
+        c1 = _pick_h1_column(out)  # <— usa el nombre REAL (1 o "1")
+        if c1 is not None and "y_pred" not in out.columns:
+            out["y_pred"] = pd.to_numeric(out[c1], errors="coerce")
+        elif "y_pred" in out.columns:
+            out["y_pred"] = pd.to_numeric(out["y_pred"], errors="coerce")
+        else:
+            # Fallback: crear y_pred NaN manteniendo el flujo (evita KeyError aguas arriba)
+            print(f"ADVERTENCIA: No se encontró columna de predicción (y_pred/yhat/1) en {list(out.columns)}. Rellenando NaN.")
+            out["y_pred"] = np.nan
 
-    # Errores base
-    out["error"] = out["y_true"] - out["y_pred"]
-    out["abs_error"] = out["error"].abs()
-    out["sq_error"] = out["error"] ** 2
+    # (C) y_true: si no está, intentar deducir
+    if "y_true" not in out.columns:
+        if "y" in out.columns:
+            out["y_true"] = pd.to_numeric(out["y"], errors="coerce")
+        elif "price_t1" in out.columns:
+            out["y_true"] = pd.to_numeric(out["price_t1"], errors="coerce")
+        elif price is not None:
+            out["y_true"] = pd.to_numeric(price.reindex(out.index).ffill(), errors="coerce")
 
-    # Direcciones
-    if target.lower().startswith("level"):
-        # dirección = cambio del nivel
-        out["direction_true"] = np.sign(out["y_true"].diff())
-    else:
-        # para returns, el signo del retorno
-        out["direction_true"] = np.sign(out["y_true"])
-    out["direction_pred"] = np.sign(out["y_pred"])
+    # ---- Errores y direcciones (solo si hay y_true & y_pred)
+    if {"y_true", "y_pred"} <= set(out.columns):
+        out["error"] = (pd.to_numeric(out["y_true"], errors="coerce")
+                        - pd.to_numeric(out["y_pred"], errors="coerce"))
+        out["abs_error"] = out["error"].abs()
+        out["sq_error"] = out["error"].pow(2)
 
-    # Mantener orden flexible (no forzamos demasiado para no romper hojas previas)
+        if "direction_true" not in out.columns:
+            d = pd.to_numeric(out["y_true"], errors="coerce").diff()
+            dir_true = pd.Series(index=out.index, dtype=object)
+            dir_true[d > 0] = "↑"
+            dir_true[d < 0] = "↓"
+            dir_true[d == 0] = "="
+            out["direction_true"] = dir_true
+
+        if "direction_pred" not in out.columns and "y_pred" in out.columns:
+            d = pd.to_numeric(out["y_pred"], errors="coerce").diff()
+            dir_pred = pd.Series(index=out.index, dtype=object)
+            dir_pred[d > 0] = "↑"
+            dir_pred[d < 0] = "↓"
+            dir_pred[d == 0] = "="
+            out["direction_pred"] = dir_pred
+
+    # ---- Horizon (opcional)
+    if horizon is not None and "horizon" not in out.columns:
+        out["horizon"] = int(horizon)
+
+    out.index.name = "ds"
     return out
 
-
 def compute_directional_accuracy(df: pd.DataFrame) -> Optional[float]:
-    """Accuracy de dirección (signo) entre y_true y y_pred. Requiere direction_true y direction_pred."""
+    """Accuracy de dirección (↑/↓) entre y_true y y_pred. Requiere direction_true y direction_pred."""
     if not {"direction_true", "direction_pred"} <= set(df.columns):
         return None
-    mask = df[["direction_true", "direction_pred"]].dropna()
-    if mask.empty:
+    pair = df[["direction_true", "direction_pred"]].dropna()
+    if pair.empty:
         return None
-    return float((np.sign(mask["direction_true"]) == np.sign(mask["direction_pred"])).mean())
+    # Comparación por igualdad de símbolos (no usar np.sign en strings)
+    acc = (pair["direction_true"] == pair["direction_pred"]).astype(float)
+    return float(acc.mean()) if len(acc) else None
 
 
 def compute_sortino(df: pd.DataFrame, annualization: Optional[float] = None) -> Optional[float]:
@@ -245,35 +308,52 @@ def _inject_window_bounds_per_row(
     price_index: Optional[pd.DatetimeIndex],
 ) -> pd.DataFrame:
     """
-    Inserta por fila las columnas 'fecha_inicio_ventana' y 'fecha_fin_ventana' basadas en:
-      - Posición de ds en el índice real de precio (price_index) si se proporciona.
-      - initial_train: tamaño de la ventana de entrenamiento usada en el rolling walk-forward.
-    Si no hay price_index o initial_train, pone el rango global como fallback.
+    Inserta por fila las columnas 'fecha_inicio_ventana' y 'fecha_fin_ventana'.
+
+    - Si existe la columna 'ds', la usa.
+    - Si NO existe, usa el índice (idealmente DatetimeIndex) como fuente de fechas.
+    - Con 'price_index' y 'initial_train' calcula las ventanas por fila (rolling).
+    - Si faltan estos, aplica un rango global como fallback.
     """
     out = df.copy()
     out["fecha_inicio_ventana"] = pd.NaT
     out["fecha_fin_ventana"] = pd.NaT
 
+    # --- Obtener la serie de fechas (columna 'ds' o índice) de forma robusta
+    if "ds" in out.columns:
+        ds_series = _coerce_datetime_series(out["ds"])
+    else:
+        # usar el índice como 'ds'
+        if isinstance(out.index, pd.DatetimeIndex):
+            ds_series = pd.Series(out.index, index=out.index)
+        else:
+            # coerción segura a datetime desde el índice
+            idx_dt = pd.to_datetime(out.index, errors="coerce")
+            # en algunos casos, .to_series() no mantiene el mismo index de 'out'
+            ds_series = pd.Series(idx_dt, index=out.index)
+
+    # --- Caso sin info suficiente para hacer ventanas por fila: rango global
     if price_index is None or initial_train is None or initial_train <= 0:
-        # Fallback: rango global
-        if "ds" in out.columns and not out["ds"].isna().all():
-            out["fecha_inicio_ventana"] = out["ds"].min()
-            out["fecha_fin_ventana"] = out["ds"].max()
+        if ds_series.notna().any():
+            out["fecha_inicio_ventana"] = ds_series.min()
+            out["fecha_fin_ventana"] = ds_series.max()
         return out
 
-    # Creamos un lookup de posición en el índice real
+    # --- Ventanas por fila basadas en el índice real de precio
     pos = pd.Series(index=price_index, data=np.arange(len(price_index)))
-    ds_clean = _coerce_datetime_series(out["ds"])
+    # normalizar (naive) ds_series para búsquedas
+    ds_series = _coerce_datetime_series(ds_series)
+
     for i in range(len(out)):
-        dsi = ds_clean.iloc[i]
+        dsi = ds_series.iloc[i]
         if pd.isna(dsi) or dsi not in pos.index:
             continue
         j = int(pos.loc[dsi])
         j0 = max(0, j - initial_train + 1)
-        out.at[i, "fecha_inicio_ventana"] = price_index[j0]
-        out.at[i, "fecha_fin_ventana"] = price_index[j]
-    return out
+        out.iat[i, out.columns.get_loc("fecha_inicio_ventana")] = price_index[j0]
+        out.iat[i, out.columns.get_loc("fecha_fin_ventana")] = price_index[j]
 
+    return out
 
 def _add_eval_columns(
     df: pd.DataFrame,
@@ -496,7 +576,13 @@ def export_backtest_excel_consolidado(
         metrics_df.to_excel(xw, sheet_name="metrics", index=False)
 
         for model_name, data in per_model_sheets.items():
-            sheet = model_name[:31] if len(model_name) > 31 else model_name
+            def _safe_sheet_name(name: str) -> str:
+                import re
+                name = re.sub(r"[\\/\*\?\:\[\]']", "_", str(name))
+                return (name or "Sheet")[:31]
+
+            # ...
+            sheet = _safe_sheet_name(model_name)
             meta = per_model_meta[model_name]
             meta_rows = [
                 ["symbol", symbol],

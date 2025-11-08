@@ -9,7 +9,7 @@ simbolo: "EURUSD"
 simbolo_spy: "US500"
 
 # Timeframe para la descarga desde MT5 (válidos: M1/M5/M15/M30/H1/H4/D1/W1/MN1)
-timeframe: "H1"
+timeframe: "D1"
 
 # Cuántas barras traer desde MT5 antes de cualquier recorte/resampleo.
 cantidad_datos: 1500
@@ -27,7 +27,7 @@ mt5:
 eda:
   # Frecuencia de resampleo para estandarizar OHLC antes de los análisis.
   # H = intradía por horas (H1/H4); D = diario.
-  frecuencia_resampleo: "H"
+  frecuencia_resampleo: "D"
 
 # ================================
 # MODO NORMAL (compatibilidad)
@@ -53,27 +53,54 @@ modelos:
     objetivo: "retornos"
     horizonte: 5
     params:
-      order: [1,1,1]
-      seasonal_order: [0,0,0,0]
+      auto: true          # selección por ventana
+      metric: aic         # o "bic"
+      seasonal: false     # true si hay estacionalidad; define m
+      m: 12               # solo si seasonal=true
+      modo: retornos      # o "nivel"
+      max_p: 2
+      max_q: 2
+      max_P: 2
+      max_Q: 2
+      max_d: 2
+      max_D: 1
       enforce_stationarity: false
       enforce_invertibility: false
     normal: {}
     backtest:
-      engine: "classic_auto" 
+      engine: "model" 
+# --------------------------------
+  # 2. RANDOM WALK (Nuevo)
+  # --------------------------------
+  - name: "RW"  # Puede llamarlo "RandomWalk" o "RW"
+    enabled: true
+    objetivo: "retornos" # O 'level'
+    horizonte: 5
+    params:
+      # Fija el orden a (0, 1, 0)
+      order: [0, 1, 0] 
+      # Sin estacionalidad
+      seasonal_order: [0, 0, 0, 0] 
+      enforce_stationarity: false
+      enforce_invertibility: false
+    normal: {}
+    backtest:
+      # También debe usar el motor 'classic_auto'
+      engine: "classic_auto"
 
   - name: "PROPHET"
     enabled: true
     objetivo: "retornos"
     horizonte: 5
     params:
-      frequency_hint: "H"          # CLAVE para intradía H1/H4
+      frequency_hint: "D1"          # CLAVE para intradía H1/H4
       changepoint_prior_scale: 0.05
       seasonality_mode: "additive"
     normal: {}
     backtest:
       engine: "model"
       prophet:
-        frequency_hint: "H"
+        frequency_hint: "D1"
         yearly_seasonality: false
         weekly_seasonality: true
         daily_seasonality: true
