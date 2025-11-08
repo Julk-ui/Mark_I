@@ -111,6 +111,48 @@ get_model = _import_get_model()
 evaluate_many, save_backtest_excel, save_backtest_plots, run_backtest, run_backtest_many = _import_bt()
 _exportar_excel = _import_reporter()
 
+# === Split temporal para train/test (hold-out) ===
+def _split_train_valid(price, cfg_valid):
+    """
+    price: pd.Series con índice datetime y dtype numérico (ej. df['Close'])
+    cfg_valid: dict con las llaves 'modo', 'n', 'start', 'end' tomadas de config['validacion']
+    return: (price_train, price_valid)  # Series
+    """
+    import pandas as pd
+
+    if not isinstance(cfg_valid, dict) or not cfg_valid:
+        # Sin configuración -> todo es train, no hay valid
+        return price, None
+
+    modo = str(cfg_valid.get("modo", "last_n")).lower()
+    if modo == "date_range":
+        start = cfg_valid.get("start", None)
+        end   = cfg_valid.get("end", None)
+        if start is None or end is None:
+            # Config incompleta -> no split
+            return price, None
+        start = pd.to_datetime(start)
+        end   = pd.to_datetime(end)
+        mask_valid = (price.index >= start) & (price.index <= end)
+    else:
+        # last_n por defecto
+        n = int(cfg_valid.get("n", 0))
+        if n <= 0 or n >= len(price):
+            # n inválido -> no split
+            return price, None
+        mask_valid = price.index.isin(price.index[-n:])
+
+    price_valid = price[mask_valid]
+    price_train = price[~mask_valid]
+
+    # Sanity checks para evitar splits ridículos
+    if len(price_train) < 50 or len(price_valid) < 10:
+        # Si queda muy pequeño, mejor no dividir
+        return price, None
+
+    return price_train, price_valid
+
+
 
 def _safe_model_tag(tag: str) -> str:
     """

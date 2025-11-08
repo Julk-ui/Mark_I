@@ -43,6 +43,14 @@ modelo:
     enforce_stationarity: false
     enforce_invertibility: false
 
+
+validacion:
+  modo: "last_n"        # "last_n" | "date_range"
+  n: 500                # si modo=last_n: últimos N puntos para el set de prueba (test/validación)
+  # Alternativa:
+  # start: "2024-01-01" # si modo=date_range (inclusive)
+  # end:   "2024-12-31"
+
 # ================================
 # CATÁLOGO DE MODELOS (multi-modelo)
 # ================================
@@ -168,3 +176,4 @@ bt:
 defaults:
   normal: {}
   backtest: {}
+
